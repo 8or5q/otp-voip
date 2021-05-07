@@ -15,7 +15,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt update -y \
       ninja-build \
       wget \
       gnupg2 \
- && pip3 install meson
+ && pip3 install meson==0.57.2
+# meson 0.58 was not working properly
 
 
 FROM base_dependencies as gstreamer_dependencies
