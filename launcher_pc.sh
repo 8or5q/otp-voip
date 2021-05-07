@@ -1,5 +1,7 @@
 #!/bin/bash
 
+mkdir -p ./.otp_client
+
 DEVICES=""
 for device in /dev/ttyUSB*
 do
