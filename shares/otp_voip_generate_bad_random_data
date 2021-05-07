@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+
+import os
+
+with open('bad_pseudo_random_data.rnd', 'wb') as fout:
+    fout.write(os.urandom(200000000))

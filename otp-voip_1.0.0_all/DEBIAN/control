@@ -1,0 +1,9 @@
+Package: otp-voip
+Version: 1.0.0
+Architecture: all
+Essential: no
+Priority: optional
+Depends: srt (>=1.4.2.20210428-1), webrtc-audio-processing (>=0.3.1.20210428-1), gstreamer-voip (>=1.18.4.20210428-1), python3-tk, v4l-utils, libatlas3-base, python3-pip
+Maintainer: 76275385+8or5q@users.noreply.github.com
+Description: A point to point video and voice chat package supporting one-time-pad built on gstreamer with srt.
+

@@ -1,0 +1,8 @@
+*/*.deb
+*/*.ini
+*/*.rnd
+.otp_client/*
+shares/logs
+*.7z
+todo.txt
+

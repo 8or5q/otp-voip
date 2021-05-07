@@ -1,0 +1,827 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import ctypes
+import tkinter
+from tkinter import filedialog
+import gi
+import glob
+import functools
+import multiprocessing
+import socket
+import time
+import queue
+import numpy
+import hashlib
+import collections
+import subprocess
+import configparser
+import pulsectl
+import json
+import traceback
+import re
+
+#APP_SETTINGS_PATH = os.path.dirname(__file__)
+APP_SETTINGS_PATH = os.path.expanduser('~/.otp_client/')
+if not os.path.exists(APP_SETTINGS_PATH):
+    os.mkdir(APP_SETTINGS_PATH)
+INI_FILE_NAME = 'config.ini'
+AUTOCALL_PIN = 18
+SHUTDOWN_PIN = 23
+if os.path.exists('/opt/vc/bin/raspivid'):
+    RASPBERRY_PI = True
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setmode(GPIO.BCM)    
+        GPIO.setup(AUTOCALL_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)  
+        GPIO.setup(SHUTDOWN_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) 
+        RASPBERRY_PI_GPIO = True
+    except Exception:
+        traceback.print_exc()
+        RASPBERRY_PI_GPIO = False
+else:
+    RASPBERRY_PI = False
+    RASPBERRY_PI_GPIO = False
+
+do_autocall = RASPBERRY_PI_GPIO and (GPIO.input(AUTOCALL_PIN) == 0)
+do_shutdown = RASPBERRY_PI_GPIO and (GPIO.input(SHUTDOWN_PIN) == 0)
+if do_autocall:
+    time.sleep(5) # wait for network interfaces and os to stabalize
+
+# globals
+player = None
+video_window = None
+player_process = None
+proxy_ready = multiprocessing.Value(ctypes.c_bool, False)
+proxy_stop = multiprocessing.Value(ctypes.c_bool, False)
+proxy_process = None
+close_client = False
+config = configparser.ConfigParser()
+if not os.path.exists(os.path.join(APP_SETTINGS_PATH, 'out.rnd')):
+    with open(os.path.join(APP_SETTINGS_PATH, 'out.rnd'), 'wb') as fout:
+        fout.write(os.urandom(10000000))
+if not os.path.exists(os.path.join(APP_SETTINGS_PATH, 'in.rnd')):
+    with open(os.path.join(APP_SETTINGS_PATH, 'in.rnd'), 'wb') as fout:
+        fout.write(os.urandom(10000000))
+if not os.path.exists(os.path.join(APP_SETTINGS_PATH, INI_FILE_NAME)):
+    config.read_dict(
+        {
+            'main': 
+            {
+                'embedded': 'yes',
+                'latency': '400',
+                'encryption': 'yes',
+                'camera': 'webcam-jpeg',
+                'video_encoder': 'x264',
+                'resolution': '1280x720',
+                'echo_cancellation': 'yes',
+                'auto_white_balance': 'incadescent',
+                'video_bitrate': '524288',
+                'audio_bitrate': '16384',
+                'otp_out_positions': json.dumps(
+                        {
+                            os.path.join(APP_SETTINGS_PATH, 'out.rnd'): 
+                            os.path.getsize(os.path.join(APP_SETTINGS_PATH, 'out.rnd'))
+                        }
+                    ),
+                'otp_out_file': os.path.join(APP_SETTINGS_PATH, 'out.rnd'),
+                'otp_in_file': os.path.join(APP_SETTINGS_PATH, 'in.rnd'),
+                'udp_hole_puncher_server_address': 'yourserver.com',
+                'udp_hole_puncher_server_port': 10000,
+                'udp_hole_puncher_session_id': 'some_id_to_uniquely_identify_two_users_seeking_each_other',
+                'protocol': 'udp-proxy',
+                'direct_partner_address': '192.168.1.121',
+                'direct_partner_port': '9998',
+                'direct_local_port': '9999',
+                'loopback_mode': 'yes',
+                'audio_in': '',
+                'audio_out': '',
+                'video_in': '/dev/video0',
+            },
+        }
+    )
+    with open(os.path.join(APP_SETTINGS_PATH, INI_FILE_NAME), 'w') as config_file:
+        config.write(config_file)
+else:
+    config.read(os.path.join(APP_SETTINGS_PATH, INI_FILE_NAME))
+print({section: dict(config[section]) for section in config.sections()})
+config_main = config['main']
+otp_out_positions = json.loads(config_main['otp_out_positions'])
+if os.path.exists(config_main['otp_out_file']):
+    if config_main['otp_out_file'] not in otp_out_positions:
+        otp_out_positions[config_main['otp_out_file']] = os.path.getsize(config_main['otp_out_file'])
+    temp_otp_out_position = otp_out_positions[config_main['otp_out_file']]
+else:
+    temp_otp_out_position = 0
+print(f'Read OTP Out Position {temp_otp_out_position}')
+otp_out_position = multiprocessing.Value(ctypes.c_ulonglong, temp_otp_out_position)
+otp_in_position = multiprocessing.Value(ctypes.c_ulonglong, 999999999999999)
+
+gi.require_version('Gst', '1.0')
+gi.require_version('GstVideo', '1.0')
+from gi.repository import Gst, GObject, GdkX11, GstVideo
+
+Gst.init(None)
+
+pulse = pulsectl.Pulse('my-client-name')
+
+# import os
+# with open(config_main['otp_out_file'], 'wb') as fout:
+#     fout.write(os.urandom(50*1024*1024))
+
+class OTPProxy(object):
+    
+    LENGTH_SIZE = 4
+    POSITION_SIZE = 8
+    NONCE_SIZE = 4
+    HASH_SIZE = 20
+    MESSAGE_OVERHEAD_SIZE = LENGTH_SIZE+POSITION_SIZE+NONCE_SIZE+HASH_SIZE
+    HASH_OFFSET = LENGTH_SIZE+POSITION_SIZE
+    NONCE_OFFSET = HASH_OFFSET+HASH_SIZE
+    MESSAGE_OFFSET = NONCE_OFFSET+NONCE_SIZE
+    #TRUNCATE_EVERY_N_BYTES = 2*1024*1024
+    UPDATE_GLOBAL_OTP_POSITIONS_EVERY_N_SECONDS = 5
+    IN_TRUNCATE_GRACE_WINDOW = 2*1024*1024 # facilitates udp packet out of ordering.
+    
+
+    def __init__(self):
+        global otp_out_position, config
+        out_path = config_main['otp_out_file']
+        in_path = config_main['otp_in_file']
+        self.output = open(out_path, mode='r+b', buffering=1)
+        self.output_position = otp_out_position.value
+        #self.output_next_truncate_position = self.output_position - self.output_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
+        self.input = open(in_path, mode='r+b', buffering=1)
+        self.input_min_position = None
+        #self.input_next_truncate_position = None
+        self.update_global_otp_positions_at_time = time.time() + 5
+        self.input_file_size = os.path.getsize(in_path)
+        #self.encrypt_durations = collections.defaultdict(int)
+        #self.decrypt_durations = collections.defaultdict(int)
+
+    def encrypt(self, message):
+        global otp_out_position
+        message_size = len(message)
+        read_size = 2*OTPProxy.NONCE_SIZE + OTPProxy.HASH_SIZE + message_size
+        packed_size = message_size + OTPProxy.MESSAGE_OVERHEAD_SIZE
+        self.output_position -= read_size
+        self.output.seek(self.output_position)
+        #start_time = time.time()
+        otp_data = self.output.read(read_size)
+        #duration = time.time() - start_time
+        #rounded_duration = round(duration,2)
+        #self.encrypt_durations[rounded_duration] += 1
+        #if duration > 0.05:
+        #    print('enc\n' + '\n'.join(f'{k}: {self.encrypt_durations[k]}' for k in sorted(self.encrypt_durations.keys())))
+        #if self.output_position < self.output_next_truncate_position:
+        #    truncate_to = self.output_position - self.output_position % -OTPProxy.TRUNCATE_EVERY_N_BYTES
+        #    print(f"out {self.output_position} {truncate_to}")
+        #    self.output.truncate(truncate_to)
+        #    self.output_next_truncate_position = truncate_to - OTPProxy.TRUNCATE_EVERY_N_BYTES
+        
+        result = []
+        result.append(message_size.to_bytes(4, byteorder="little", signed=False))
+        result.append(self.output_position.to_bytes(8, byteorder="little", signed=False))
+        part_to_hash = otp_data[0:OTPProxy.NONCE_SIZE] + message
+        part_to_encrypt = hashlib.sha1(part_to_hash).digest() + part_to_hash
+        result.append(numpy.bitwise_xor(
+            numpy.frombuffer(otp_data[OTPProxy.NONCE_SIZE:read_size], dtype=numpy.ubyte),
+            numpy.frombuffer(part_to_encrypt, dtype=numpy.ubyte)
+        ).tobytes())
+        return b''.join(result)
+
+    def decrypt(self, message):
+        global otp_in_position
+        message_size = int.from_bytes(message[0:OTPProxy.LENGTH_SIZE], byteorder='little', signed=False)
+        read_size = 2*OTPProxy.NONCE_SIZE + OTPProxy.HASH_SIZE + message_size
+        packed_size = message_size + OTPProxy.MESSAGE_OVERHEAD_SIZE
+        position = int.from_bytes(message[OTPProxy.LENGTH_SIZE:OTPProxy.HASH_OFFSET], byteorder='little', signed=False)
+        if position + read_size > self.input_file_size:
+            print('position too high %r' % (position, read_size, self.input_file_size))
+            return 'position too high', b''
+        if self.input_min_position is None:
+            self.input_min_position = position
+        #    self.input_next_truncate_position = self.input_min_position - self.input_min_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
+        elif position < self.input_min_position:
+            self.input_min_position = position
+        self.input.seek(position)
+        #start_time = time.time()
+        otp_data = self.input.read(read_size)
+        #duration = time.time() - start_time
+        #rounded_duration = round(duration,2)
+        #self.decrypt_durations[rounded_duration] += 1
+        #if duration > 0.05:
+        #    print('dec\n' + '\n'.join(f'{k}: {self.decrypt_durations[k]}' for k in sorted(self.decrypt_durations.keys())))
+        decrypted_part = numpy.bitwise_xor(
+            numpy.frombuffer(otp_data[OTPProxy.NONCE_SIZE:read_size], dtype=numpy.ubyte),
+            numpy.frombuffer(message[OTPProxy.HASH_OFFSET:packed_size], dtype=numpy.ubyte)
+        ).tobytes()
+        if decrypted_part[OTPProxy.HASH_SIZE:OTPProxy.HASH_SIZE+OTPProxy.NONCE_SIZE] != otp_data[0:OTPProxy.NONCE_SIZE]:
+            print('bad nonce %r' % (decrypted_part[OTPProxy.HASH_SIZE:OTPProxy.HASH_SIZE+OTPProxy.NONCE_SIZE], otp_data[0:OTPProxy.NONCE_SIZE]))
+            return 'bad nonce', b''
+        if decrypted_part[0:OTPProxy.HASH_SIZE] != hashlib.sha1(decrypted_part[OTPProxy.HASH_SIZE:]).digest():
+            print('bad hash %r' % (decrypted_part[0:OTPProxy.HASH_SIZE], hashlib.sha1(decrypted_part[OTPProxy.HASH_SIZE:]).digest()))
+            return 'bad hash', b''
+        # only truncate after validation is complete
+        #if self.input_min_position < self.input_next_truncate_position and self.input_next_truncate_position < self.input_file_size:
+        #    if self.input_next_truncate_position + OTPProxy.IN_TRUNCATE_GRACE_WINDOW < self.input_file_size:
+        #        self.input_file_size = self.input_next_truncate_position + OTPProxy.IN_TRUNCATE_GRACE_WINDOW
+        #        print(f"in {self.input_file_size}")
+        #        self.input.truncate(self.input_file_size)
+        #    self.input_next_truncate_position = self.input_min_position - self.input_min_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
+        return None, decrypted_part[OTPProxy.NONCE_SIZE+OTPProxy.HASH_SIZE:]
+
+    def cleanup(self):
+        pass
+        #print('enc\n' + '\n'.join(f'{k}: {self.encrypt_durations[k]}' for k in sorted(self.encrypt_durations.keys())))
+        #print('dec\n' + '\n'.join(f'{k}: {self.decrypt_durations[k]}' for k in sorted(self.decrypt_durations.keys())))
+        #print(f"out {self.output_position}")
+        #self.output.truncate(self.output_position)
+        #if self.input_min_position is not None:
+        #    print(f"in {self.input_min_position}")
+        #    self.input.truncate(self.input_min_position)
+
+    @staticmethod
+    def run(local_relay_address=('127.0.0.1', 9998), local_listen_address=('0.0.0.0', 9999), server_address=('yourserver.com', 10000), session_id=b'yoursession', use_encryption=False):
+        
+        global proxy_ready, proxy_stop
+        
+        sock_local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock_local.bind(local_listen_address)
+        print("local_listen_address: " + repr(local_listen_address))
+        sock_local.settimeout(None)
+        while True:
+            sock_local.sendto(session_id, server_address)
+            sock_local.settimeout(2)
+            try:
+                remote_data, server_address = sock_local.recvfrom(4096)
+                break
+            except socket.timeout:
+                time.sleep(1)
+            if proxy_stop.value:
+                return
+        remote_ip, remote_port = remote_data.decode('utf-8').strip().split(':')
+        remote_address = (remote_ip, int(remote_port))
+        print("remote_address: " + repr(remote_address))
+                
+        otp_proxy = OTPProxy()
+        proxy_ready.value = True
+        sock_local.settimeout(1)
+        print("ready")
+        try:
+            while not proxy_stop.value:
+                try:
+                    data, address = sock_local.recvfrom(4096)
+                    #print("data in")
+                except socket.timeout:
+                    continue
+                if not data:
+                    print("*")
+                    break
+                error = None
+                if address[0] == local_relay_address[0]:
+                    target_address = remote_address
+                    if use_encryption:
+                        data = otp_proxy.encrypt(data)
+                    #print(f'outbound sending {data} from {address} to {target_address}')
+                    sock_local.sendto(data, target_address)
+                elif address[0] == remote_address[0]:
+                    target_address = local_relay_address
+                    if use_encryption:
+                        error, data = otp_proxy.decrypt(data)
+                        if error is not None:
+                            print(f'error decrypting "{error}" dropping packet')
+                    if error is None:
+                        #print(f'inbound sending {data} from {address} to {target_address}')
+                        sock_local.sendto(data, target_address)
+                else:
+                    print(f'Unexpected address {address} no known target.')
+                if time.time() > otp_proxy.update_global_otp_positions_at_time:
+                    otp_out_position.value = otp_proxy.output_position
+                    otp_in_position.value = otp_proxy.input_min_position if otp_proxy.input_min_position is not None else 999999999999999
+                    otp_proxy.update_global_otp_positions_at_time = time.time() + 5
+        finally:
+            otp_proxy.cleanup()
+            otp_out_position.value = otp_proxy.output_position
+            otp_in_position.value = otp_proxy.input_min_position if otp_proxy.input_min_position is not None else 999999999999999
+
+controls = tkinter.Tk()
+controls.geometry("+360+40")
+controls.attributes('-topmost', True)
+controls.update()
+
+def set_option(pad_name, property_name, value, lookup=None):
+    global player
+    if player is None:
+        return
+    if pad_name == 'rpicamsrc0' and video_source_option.variable.get() in ('webcam', 'webcam-jpeg'):
+        return
+    if lookup is not None:
+        value = lookup[value]
+    player.get_child_by_name(pad_name).set_property(property_name, value)
+
+class PlayerMenuOption(object):
+    def __init__(self, parent, label, config_name, inter_type, set_func, options, default):
+        self.label = tkinter.Label(parent, text=label)
+        self.label.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
+        self.variable = inter_type(parent)
+        self.variable.set(default) 
+        def set_callback(*args):
+            global config_main
+            if config_name is not None:
+                config_main[config_name] = str(self.variable.get())
+            if set_func is not None:
+                set_func(self.variable.get())
+        self.variable.trace("w", set_callback)
+        self.option_menu = tkinter.OptionMenu(parent, self.variable, *options)
+        self.option_menu.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
+
+class PlayerEntry(object):
+    def __init__(self, parent, label, config_name, inter_type, set_func):
+        self.label = tkinter.Label(parent, text=label)
+        self.label.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
+        self.variable = inter_type(parent)
+        if config_name is not None:
+            self.variable.set(config_main[config_name])
+        def set_callback(*args):
+            global config_main
+            if config_name is not None:
+                config_main[config_name] = str(self.variable.get())
+            if set_func is not None:
+                set_func(self.variable.get())
+        self.variable.trace("w", set_callback)
+        self.entry = tkinter.Entry(parent, textvariable=self.variable)
+        self.entry.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
+
+def create_toggled_frame(parent, text, expanded=False):
+    top_frame = tkinter.Frame(parent, relief="raised", borderwidth=1)
+    top_frame.pack(fill="x", expand=1, pady=2, padx=2, anchor="n")
+    title_frame = tkinter.Frame(top_frame)
+    title_frame.pack(fill="x", expand=1)
+    tkinter.Label(title_frame, text=text).pack(side="left", fill="x", expand=1)
+
+    def toggle():
+        if expanded_.get() == 1:
+            expanded_.set(0)
+            sub_frame.forget()
+            toggle_button.configure(text="+")
+        else:
+            expanded_.set(1)
+            sub_frame.pack(padx=3, pady=3, fill="x", expand=1)
+            toggle_button.configure(text="-")
+
+    toggle_button = tkinter.Button(title_frame, width=2, text="+", command=toggle)
+    toggle_button.pack(side="left")
+    sub_frame = tkinter.Frame(top_frame, relief="sunken", borderwidth=1)
+    expanded_ = tkinter.IntVar(master=parent)
+    if expanded:
+        expanded_.set(1)
+        sub_frame.pack(padx=3, pady=3, fill="x", expand=1)
+        toggle_button.configure(text="-")
+    else:
+        expanded_.set(0)
+    return sub_frame
+        
+# Encryption
+encryption_frame = create_toggled_frame(controls, 'Encryption', False)
+use_encryption_option = PlayerMenuOption(encryption_frame, 'Use Encryption:', 'encryption', tkinter.StringVar, None, ['yes', 'no'], config_main['encryption'])
+def store_otp_positions():
+    global otp_out_position
+    config_main['otp_out_positions'] = json.dumps(otp_out_positions)
+def select_otp_out_file():
+    new_otp_out_file = filedialog.askopenfilename(initialdir="/", title="Select OTP Out file", filetypes=(("random data file","*.rnd"),("all files","*.*")))
+    if new_otp_out_file:
+        global otp_out_position
+        otp_out_positions[config_main['otp_out_file']] = otp_out_position.value
+        config_main['otp_out_file'] = new_otp_out_file
+        otp_out_file_entry.variable.set(config_main['otp_out_file'])
+        if config_main['otp_out_file'] not in otp_out_positions:
+            otp_out_positions[config_main['otp_out_file']] = os.path.getsize(config_main['otp_out_file'])
+        otp_out_position.value = otp_out_positions[config_main['otp_out_file']]
+        update_otp_positions()
+        store_otp_positions()
+otp_out_select_file_button = tkinter.Button(encryption_frame, text='Select OTP Out File', command=select_otp_out_file)
+otp_out_select_file_button.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
+otp_out_file_entry = PlayerEntry(encryption_frame, 'OTP Out File', 'otp_out_file', tkinter.StringVar, None)
+otp_out_file_entry.variable.set(config_main['otp_out_file'])
+def set_otp_out_position(position):
+    global otp_out_position
+    otp_out_position.value = position
+    otp_out_positions[config_main['otp_out_file']] = otp_out_position.value
+    store_otp_positions()
+otp_out_position_entry = PlayerEntry(encryption_frame, 'OTP Out Position', None, tkinter.IntVar, set_otp_out_position)
+def truncate_otp_out_position():
+    global otp_out_position
+    otp_out_positions[config_main['otp_out_file']] = otp_out_position.value
+    if otp_out_position.value < os.path.getsize(config_main['otp_out_file']):
+        otp_data = open(config_main['otp_out_file'], mode='r+b', buffering=1)
+        otp_data.truncate(otp_out_position.value)
+        otp_data.close()
+otp_out_position_truncate_button = tkinter.Button(encryption_frame, text='Truncate OTP Out', command=truncate_otp_out_position)
+otp_out_position_truncate_button.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
+def select_otp_in_file():
+    new_otp_in_file = filedialog.askopenfilename(initialdir="/", title="Select OTP In file", filetypes=(("random data file","*.rnd"),("all files","*.*")))
+    if new_otp_in_file:
+        config_main['otp_in_file'] = new_otp_in_file
+        otp_in_file_entry.variable.set(config_main['otp_in_file'])
+otp_in_select_file_button = tkinter.Button(encryption_frame, text='Select OTP In File', command=select_otp_in_file)
+otp_in_select_file_button.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
+otp_in_file_entry = PlayerEntry(encryption_frame, 'OTP In File', 'otp_in_file', tkinter.StringVar, None)
+otp_in_file_entry.variable.set(config_main['otp_in_file'])
+def update_otp_positions():
+    global otp_out_position, otp_in_position
+    otp_out_positions[config_main['otp_out_file']] = otp_out_position.value
+    if otp_out_position.value != otp_out_position_entry.variable.get():
+        otp_out_position_entry.variable.set(otp_out_position.value)
+    if otp_in_position.value != otp_in_position_entry.variable.get():
+        otp_in_position_entry.variable.set(otp_in_position.value)
+otp_in_position_entry = PlayerEntry(encryption_frame, 'OTP In Position', None, tkinter.IntVar, None)
+def truncate_otp_in_position():
+    global otp_in_position
+    if otp_in_position.value < os.path.getsize(config_main['otp_in_file']):
+        otp_data = open(config_main['otp_in_file'], mode='r+b', buffering=1)
+        otp_data.truncate(otp_in_position.value)
+        otp_data.close()
+otp_in_position_truncate_button = tkinter.Button(encryption_frame, text='Truncate OTP In', command=truncate_otp_in_position)
+otp_in_position_truncate_button.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
+update_otp_positions()
+
+# Video
+video_frame = create_toggled_frame(controls, 'Video', False)
+video_in_list = glob.glob('/dev/video*')
+def set_video_in(video_in, reset_video_source=True):
+    global webcam_capabilities
+    if RASPBERRY_PI:
+        webcam_capabilities = {'rpicamsrc': {'320x240': [30], '640x480': [30], '800x448': [30], '848x480': [30], '1280x720': [30], '1920x1080': [30]}}
+    else:
+        p = subprocess.Popen(['v4l2-ctl', '--device', '/dev/video0', '--list-formats-ext'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output, err = p.communicate(b"")
+        rc = p.returncode
+        webcam_capabilities = {}
+        matches = re.findall(rb'\[\d+\]: \'(?P<format>MJPG|\w+)\'|Size\: Discrete (?P<resolution>\d+x\d+)|(?P<fps>\d+.\d+) fps', output, re.DOTALL)
+        for t_format, t_resolution, t_fps in matches:
+            if t_format:
+                format = t_format.decode('utf8')
+                if format == 'MJPG':
+                    format = 'webcam-jpeg'
+                else:
+                    format = 'webcam'
+                if format not in webcam_capabilities:
+                    webcam_capabilities[format] = {}
+            elif t_resolution:
+                resolution = t_resolution.decode('utf8')
+                if resolution not in webcam_capabilities[format]:
+                    webcam_capabilities[format][resolution] = []
+            else:
+                assert t_fps
+                webcam_capabilities[format][resolution].append(float(t_fps.decode('utf8')))
+    print(webcam_capabilities)
+    if reset_video_source:
+        set_video_source(video_source_option.variable.get())
+video_in_option = PlayerMenuOption(video_frame, 'Video In:', 'video_in', tkinter.StringVar, set_video_in, video_in_list, config_main['video_in'] if config_main['video_in'] in video_in_list else video_in_list[0])
+set_video_in(video_in_option.variable.get(), reset_video_source=False)
+if RASPBERRY_PI:
+    video_source_list = ['webcam', 'rpicamsrc']
+    video_encoder_list = ['v4l2h264enc', 'x264', 'rpicamsrc']
+else:
+    video_source_list = ['webcam', 'webcam-jpeg']
+    video_encoder_list = ['x264']
+def set_video_source(video_source):
+    original_resolution = video_resolution_option.variable.get()
+    video_resolution_option.variable.set('')
+    video_resolution_option.option_menu['menu'].delete(0, 'end')
+    for resolution in webcam_capabilities[video_source].keys():
+        video_resolution_option.option_menu['menu'].add_command(label=resolution, command=tkinter._setit(video_resolution_option.variable, resolution))
+    if original_resolution in webcam_capabilities[video_source].keys():
+        video_resolution_option.variable.set(original_resolution) 
+    else:
+        video_resolution_option.variable.set(list(webcam_capabilities[video_source].keys())[0])
+video_source_option = PlayerMenuOption(video_frame, 'Camera:', 'camera', tkinter.StringVar, set_video_source, video_source_list, config_main['camera'])
+video_encoder_option = PlayerMenuOption(video_frame, 'Video Encoder:', 'video_encoder', tkinter.StringVar, None, video_encoder_list, config_main['video_encoder'])
+video_resolution_option = PlayerMenuOption(video_frame, 'Resolution:', 'resolution', tkinter.StringVar, None, webcam_capabilities[video_source_option.variable.get()].keys(), config_main['resolution'] if config_main['resolution'] in webcam_capabilities[video_source_option.variable.get()].keys() else list(webcam_capabilities[video_source_option.variable.get()].keys())[0])
+awb_modes = {'off':0,'auto':1,'sunlight':2,'cloudy':3,'shade':4,'tungsten':5,'fluorescent':6,'incadescent':7,'flash':8,'horizon':9}
+video_awb_option = PlayerMenuOption(video_frame, 'AWB:', 'auto_white_balance', tkinter.StringVar, functools.partial(set_option, 'rpicamsrc0', 'awb-mode', lookup=awb_modes), awb_modes.keys(), config_main['auto_white_balance'])
+def set_video_bitrate(bitrate):
+    global player
+    if player is None:
+        return
+    video_source = video_source_option.variable.get()
+    video_encoder = video_encoder_option.variable.get()
+    if RASPBERRY_PI:
+        if video_encoder == 'v4l2h264enc':
+            assert video_source == 'webcam'
+            v4l2h264enc0 = player.get_child_by_name('v4l2h264enc0')
+            v4l2h264enc0.list_properties()
+            extra_controls = v4l2h264enc0.get_property('extra-controls')
+            extra_controls.set_value('video_bitrate', bitrate)
+            v4l2h264enc0.set_property('extra-controls', extra_controls)
+        elif video_encoder == 'x264':
+            x264enc0 = player.get_child_by_name('x264enc0')
+            x264enc0.set_property('bitrate', int(bitrate/1000))
+        else:
+            assert video_source == 'rpicamsrc'
+            set_option('rpicamsrc0', 'bitrate', bitrate)
+    else:
+        assert video_encoder == 'x264'
+        x264enc0 = player.get_child_by_name('x264enc0')
+        x264enc0.set_property('bitrate', int(bitrate/1000))
+video_bitrate_option = PlayerMenuOption(video_frame, 'Video Bitrate:', 'video_bitrate', tkinter.IntVar, set_video_bitrate, [65536,98304,131072,196608,262144,327680,393216,524288,655360,786432,1048576], config_main['video_bitrate'])
+
+# Audio
+audio_frame = create_toggled_frame(controls, 'Audio', False)
+use_echo_cancellation_option = PlayerMenuOption(audio_frame, 'Echo Cancellation:', 'echo_cancellation', tkinter.StringVar, None, ['yes', 'no'], 'yes' if do_autocall else config_main['echo_cancellation'])
+audio_bitrate_option = PlayerMenuOption(audio_frame, 'Audio Bitrate:', 'audio_bitrate', tkinter.IntVar, functools.partial(set_option, 'opusenc0', 'bitrate'), [8192,12288,16384,24576,49152,65536,98304,131072], config_main['audio_bitrate'])
+audio_in_list = [p.name for p in pulse.source_list()]
+audio_in_option = PlayerMenuOption(audio_frame, 'Sound In:', 'audio_in', tkinter.StringVar, None, audio_in_list, config_main['audio_in'] if config_main['audio_in'] in audio_in_list else audio_in_list[0])
+audio_out_list = [p.name for p in pulse.sink_list()]
+audio_out_option = PlayerMenuOption(audio_frame, 'Sound Out:', 'audio_out', tkinter.StringVar, None, audio_out_list, config_main['audio_out'] if config_main['audio_out'] in audio_out_list else audio_out_list[0])
+
+# General
+general_frame = create_toggled_frame(controls, 'General', False)
+mode_option = PlayerMenuOption(general_frame, 'Video and Audio:', None, tkinter.StringVar, None, ['video', 'audio', 'both'], 'audio' if do_autocall else 'both')
+# http://gstreamer-devel.966125.n4.nabble.com/SRT-passphrase-and-latency-parameters-td4686833.html
+def set_latency(latency):
+    set_option('srtsrc0', 'latency', latency)
+    set_option('srtsink0', 'latency', latency)
+latency_option = PlayerMenuOption(general_frame, 'Latency:', 'latency', tkinter.IntVar, set_latency, [25,50,75,100,125,150,175,200,250,300,350,400,450,500,600,700,800,900,1000,1200,1400,1600,1800,2000], int(config_main['latency']))
+server_address_entry = PlayerEntry(general_frame, 'Server Address:', 'udp_hole_puncher_server_address', tkinter.StringVar, None)
+server_port_entry = PlayerEntry(general_frame, 'Server Port:', 'udp_hole_puncher_server_port', tkinter.IntVar, None)
+session_id_entry = PlayerEntry(general_frame, 'Session Id:', 'udp_hole_puncher_session_id', tkinter.StringVar, None)
+protocol_option = PlayerMenuOption(general_frame, 'Protocol:', 'protocol', tkinter.StringVar, None, ['udp-proxy','srt-proxy','udp-direct', 'srt-direct'], config_main['protocol'])
+direct_partner_address_entry = PlayerEntry(general_frame, 'Direct Partner Address:', 'direct_partner_address', tkinter.StringVar, None)
+direct_partner_port_entry = PlayerEntry(general_frame, 'Direct Partner Port:', 'direct_partner_port', tkinter.IntVar, None)
+direct_local_port_entry = PlayerEntry(general_frame, 'Direct Local Port:', 'direct_local_port', tkinter.IntVar, None)
+embedded_option = PlayerMenuOption(general_frame, 'Embedded Mode:', 'embedded', tkinter.StringVar, None, ['yes', 'no'], config_main['embedded'])
+loopback_mode_option = PlayerMenuOption(general_frame, 'Loopback Mode:', 'loopback_mode', tkinter.StringVar, None, ['yes', 'no'], config_main['loopback_mode'])
+    
+def close_app():
+    global config, controls, close_client
+    print({section: dict(config[section]) for section in config.sections()})
+    with open(os.path.join(APP_SETTINGS_PATH, INI_FILE_NAME), 'w') as config_file:
+        config.write(config_file)
+    stop_video()
+    controls.destroy()
+    close_client = True
+controls.protocol('WM_DELETE_WINDOW', close_app)    
+    
+def stop_video():
+    global player, video_window, player_process, proxy_process, proxy_stop
+    if embedded_option.variable.get() == 'yes':
+        if player is not None:
+            player.set_state(Gst.State.NULL)
+            player = None
+        if video_window is not None:
+            video_window.destroy()
+            video_window = None
+    else:
+        assert embedded_option.variable.get() == 'no'
+        if player_process is not None:
+            player_process.kill()
+    proxy_stop.value = True
+    if proxy_process is not None:
+        proxy_process.join()
+    update_otp_positions()
+    store_otp_positions()
+    
+def start_video():
+    global player, video_window, player_process, proxy_process, proxy_ready, proxy_stop, close_client
+    
+    if protocol_option.variable.get() in ('srt-proxy', 'udp-proxy'):
+        proxy_stop.value = False
+        proxy_ready.value = False
+        proxy_process = multiprocessing.Process(
+	    target=OTPProxy.run, 
+            kwargs={
+                'server_address': (config_main['udp_hole_puncher_server_address'], int(config_main['udp_hole_puncher_server_port'])), 
+                'session_id': config_main['udp_hole_puncher_session_id'].encode('utf-8'), 
+                'use_encryption': use_encryption_option.variable.get() == 'yes'
+            }
+        )
+        proxy_process.start()
+        
+        while not proxy_ready.value:
+            controls.update_idletasks()
+            controls.update()
+            if video_window is not None:
+                video_window.update_idletasks()
+                video_window.update()
+            do_shutdown = RASPBERRY_PI_GPIO and (GPIO.input(SHUTDOWN_PIN) == 0)
+            if do_shutdown:
+                close_app()
+            if close_client:
+                return
+            time.sleep(0.05)
+        
+    if embedded_option.variable.get() == 'yes':
+        def on_sync_message(bus, message, video_frame_window_id):
+            if not message.get_structure() is None:
+                if message.get_structure().get_name() == 'prepare-window-handle':
+                    image_sink = message.src
+                    image_sink.set_property("force-aspect-ratio", True)
+                    image_sink.set_window_handle(video_frame_window_id)
+                    print(f'set_window_handle: {video_frame_window_id}')
+                    
+        video_window = tkinter.Toplevel()
+        video_window.protocol('WM_DELETE_WINDOW', stop_video)
+        #window.geometry('800x448')
+        video_window.attributes('-zoomed', True) 
+
+        def toggle_fullscreen(event=None):
+            video_window.attributes("-fullscreen", not video_window.attributes("-fullscreen"))
+            return "break"
+
+        def end_fullscreen(event=None):
+            video_window.attributes("-fullscreen", False)
+            return "break"
+
+        video_window.bind("<F11>", toggle_fullscreen)
+        video_window.bind("<Escape>", end_fullscreen)
+
+        video_frame = tkinter.Frame(video_window, bg='#000000')
+        video_frame.pack(side=tkinter.BOTTOM,anchor=tkinter.S,expand=tkinter.YES,fill=tkinter.BOTH)
+
+        video_frame_window_id = video_frame.winfo_id()
+        print(f'video_frame_window_id: {video_frame_window_id}')
+        
+        video_window.update_idletasks()
+        video_window.update()
+
+    resolution_x, resolution_y = video_resolution_option.variable.get().split('x')
+
+    launch_command_parts = []
+    mode = mode_option.variable.get()
+    audio_in = audio_in_option.variable.get()
+    audio_out = audio_out_option.variable.get()
+    video_source = video_source_option.variable.get()
+    video_encoder = video_encoder_option.variable.get()
+    
+    
+    if protocol_option.variable.get() == 'srt-proxy':
+        launch_command_parts.append(
+            #f'srtsrc uri=srt://127.0.0.1:9999/ localaddress=127.0.0.1 localport=9998 mode=listener latency={latency_option.variable.get()} name=srtsrc0 '
+            f'srtsrc uri=srt://127.0.0.1:9999/ localaddress=127.0.0.1 localport=9998 mode=caller latency={latency_option.variable.get()} name=srtsrc0 '
+        )
+    elif protocol_option.variable.get() == 'udp-proxy':
+        launch_command_parts.append(
+            f'udpsrc port=9998 name=udpsrc0 '
+        )
+    else:
+        assert protocol_option.variable.get() in ('srt-direct', 'udp-direct')
+        if loopback_mode_option.variable.get() == 'yes':
+            partner_address = '127.0.0.1'
+            partner_port = direct_local_port_entry.variable.get()
+        else:
+            partner_address = direct_partner_address_entry.variable.get()
+            partner_port = direct_partner_port_entry.variable.get()
+        if protocol_option.variable.get() == 'srt-direct':
+            launch_command_parts.append(
+                #f'srtsrc uri=srt://{partner_address}:{partner_port}/ localaddress=0.0.0.0 localport={direct_local_port_entry.variable.get()} mode=listener latency={latency_option.variable.get()} name=srtsrc0 '
+                f'srtsrc uri=srt://{partner_address}:{partner_port}/ mode=caller latency={latency_option.variable.get()} name=srtsrc0 '
+            )
+        elif protocol_option.variable.get() == 'udp-direct':
+            launch_command_parts.append(
+                f'udpsrc port={direct_local_port_entry.variable.get()} name=udpsrc0 '
+            )
+    launch_command_parts.append(f'! queue ! tsparse ! tsdemux name=in ')
+    
+    if mode in ('video', 'both'):
+        launch_command_parts.append(f'in. ! h264parse ! queue ') 
+        if RASPBERRY_PI:
+            #launch_command_parts.append(f'! v4l2h264dec capture-io-mode=4 ') # can't seem to decode pc video maybe if we put a video convert before it it could handle the stream
+            launch_command_parts.append(f'! decodebin capture-io-mode=4 ')
+            #launch_command_parts.append(f'! avdec_h264 ')
+        else:
+            launch_command_parts.append(f'! avdec_h264 ')
+        launch_command_parts.append(f'! queue ') 
+        if embedded_option.variable.get() == 'yes':
+            if RASPBERRY_PI:
+                launch_command_parts.append(f'! xvimagesink async=false ')
+            else:
+                launch_command_parts.append(f'! glimagesink async=false ')
+        else:
+            assert embedded_option.variable.get() == 'no'
+            if RASPBERRY_PI:
+                launch_command_parts.append(f'! xvimagesink async=false ')
+            else:
+                launch_command_parts.append(f'! glimagesink async=false ')
+    if mode in ('audio', 'both'):
+        launch_command_parts.append(f'in. ! queue ! opusdec ')
+        if use_echo_cancellation_option.variable.get() == 'yes':
+            launch_command_parts.append(f'! webrtcechoprobe name=webrtcechoprobe0 ')
+        # pactl list
+        launch_command_parts.append(f'! queue ! pulsesink device={audio_out} async=false')
+    launch_command_parts.append(f' ')
+    
+    if mode in ('video', 'both'):
+        if RASPBERRY_PI:        
+            if video_source == 'webcam':
+                if video_encoder == 'v4l2h264enc':
+                    launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 io-mode=5 ! video/x-raw,width={resolution_x},height={resolution_y},framerate=30/1 ! v4l2h264enc output-io-mode=4 extra-controls="controls,video_bitrate={video_bitrate_option.variable.get()};" ')
+                else:
+                    assert video_encoder == 'x264'
+                    launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 ! video/x-raw,width={resolution_x},height={resolution_y},framerate=30/1 ! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate_option.variable.get()/1000)} speed-preset=superfast ')
+            else:
+                assert video_source == 'rpicamsrc'
+                assert video_encoder == 'rpicamsrc'
+                launch_command_parts.append(f'rpicamsrc rotation=90 bitrate={video_bitrate_option.variable.get()} awb-mode={awb_modes[video_awb_option.variable.get()]} preview=1 preview-encoded=1 fullscreen=0 preview-x=20 preview-y=20 preview-w=320 preview-h=190 do-timestamp=1 name=rpicamsrc0 ! video/x-h264,width={resolution_x},height={resolution_y},framerate=30/1 ')
+        else:
+            launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 ')
+            if video_source == 'webcam':
+                #launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate=30/1 ! videoconvert ')
+                launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate=30/1 ! videoconvert ! video/x-raw,format=I420 ')
+            else:
+                assert video_source == 'webcam-jpeg'
+                #launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate=30/1 ! jpegdec ')
+                launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate=30/1 ! jpegdec ! videoconvert ! video/x-raw,format=I420 ')
+            assert video_encoder == 'x264'
+            launch_command_parts.append(f'! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate_option.variable.get()/1000)} speed-preset=superfast ')
+        launch_command_parts.append(f'! queue ! h264parse config-interval=1 ! out. ')
+
+    if mode in ('audio', 'both'):
+        launch_command_parts.append(f'pulsesrc device={audio_in} do-timestamp=1 ')
+        launch_command_parts.append(f'! queue ! audioconvert ! audio/x-raw,format=S16LE,rate=48000,channels=2 ')
+        if use_echo_cancellation_option.variable.get() == 'yes':
+            launch_command_parts.append(f'! webrtcdsp ')
+        launch_command_parts.append(f'! opusenc bitrate={audio_bitrate_option.variable.get()} name=opusenc0 ! queue ! out. ')
+        
+    launch_command_parts.append(f'mpegtsmux alignment=7 name=out ')    
+    if protocol_option.variable.get() == 'srt-proxy':
+        launch_command_parts.append(
+            #f'! srtsink uri=srt://127.0.0.1:9999/ localaddress=127.0.0.1 localport=9998 mode=caller latency={latency_option.variable.get()} name=srtsink0 '
+            f'! srtsink uri=srt://127.0.0.1:9999/ localaddress=127.0.0.1 localport=9998 mode=listener latency={latency_option.variable.get()} name=srtsink0 '
+        )
+    elif protocol_option.variable.get() == 'udp-proxy':
+        launch_command_parts.append(
+            f'! udpsink host=127.0.0.1 port=9999 name=udpsink0 '
+        )
+    else:
+        assert protocol_option.variable.get() in ('srt-direct', 'udp-direct')
+        if loopback_mode_option.variable.get() == 'yes':
+            partner_address = '127.0.0.1'
+            partner_port = direct_local_port_entry.variable.get()
+        else:
+            partner_address = direct_partner_address_entry.variable.get()
+            partner_port = direct_partner_port_entry.variable.get()
+        if protocol_option.variable.get() == 'srt-direct':
+            launch_command_parts.append(
+                #f'! srtsink uri=srt://{partner_address}:{partner_port}/ mode=caller latency={latency_option.variable.get()} sync=false async=false name=srtsink0 '
+                f'! srtsink uri=srt://{partner_address}:{partner_port}/ localaddress=0.0.0.0 localport={direct_local_port_entry.variable.get()} mode=listener latency={latency_option.variable.get()} sync=false async=false name=srtsink0 '
+            )
+        elif protocol_option.variable.get() == 'udp-direct':
+            launch_command_parts.append(
+                f'! udpsink host={partner_address} port={partner_port} name=udpsink0 '
+            )
+
+    launch_command = ''.join(launch_command_parts)
+    print(launch_command)
+    if embedded_option.variable.get() == 'yes':
+        player = Gst.parse_launch(launch_command)
+
+        bus = player.get_bus()
+        bus.add_signal_watch()
+        bus.enable_sync_message_emission()
+        bus.connect('sync-message::element', on_sync_message, video_frame_window_id)
+
+        player.set_state(Gst.State.PLAYING)
+    else:
+        assert embedded_option.variable.get() == 'no'
+        arguments = ['gst-launch-1.0']
+        arguments.extend(launch_command.split(' '))
+        
+        player_process = subprocess.Popen(arguments)
+
+control_frame = create_toggled_frame(controls, 'Control', True)
+start_button = tkinter.Button(control_frame, text='Start', command=start_video)
+start_button.pack(side=tkinter.LEFT,expand=tkinter.YES,fill=tkinter.BOTH)
+stop_button = tkinter.Button(control_frame, text='Stop', command=stop_video)
+stop_button.pack(side=tkinter.LEFT,expand=tkinter.YES,fill=tkinter.BOTH)
+controls.update_idletasks()
+controls.update()
+
+if do_autocall:
+    start_video()
+
+if __name__ == '__main__':
+    #controls.mainloop()
+    #'''
+    while not close_client:
+        controls.update_idletasks()
+        controls.update()
+        if video_window is not None:
+            video_window.update_idletasks()
+            video_window.update()
+            update_otp_positions()
+        do_shutdown = RASPBERRY_PI_GPIO and (GPIO.input(SHUTDOWN_PIN) == 0)
+        if do_shutdown:
+            close_app()
+        time.sleep(0.05)
+    do_shutdown = RASPBERRY_PI_GPIO and (GPIO.input(SHUTDOWN_PIN) == 0)
+    if do_shutdown:
+        print("launching shutdown...")
+        command = "/usr/bin/sudo /sbin/shutdown -h now"
+        process = subprocess.Popen(command.split(), stdout=subprocess.PIPE)
+        output = process.communicate()[0]
+    print("client closing...")
+    #'''
+

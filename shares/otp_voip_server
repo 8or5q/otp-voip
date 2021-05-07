@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+
+import logging
+import socket
+import sys
+import collections
+import datetime
+
+logger = logging.getLogger()
+sessions = {}
+
+def addr_to_msg(addr):
+    return '{}:{}'.format(addr[0], str(addr[1])).encode('utf-8')
+
+# dont forget to run the following to open up the firewall and check
+# ufw allow 10000/udp
+# ufw status
+def main(host='0.0.0.0', port=10000):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((host, port))
+    while True:
+        session_id, addr = sock.recvfrom(4096)
+        now = datetime.datetime.utcnow()
+        if session_id not in sessions:
+            sessions[session_id] = collections.deque()
+        session = sessions[session_id]
+        address_found_idx = -1
+        for idx, (_, session_addr) in enumerate(session):
+            if session_addr == addr:
+                address_found_idx = idx
+        if address_found_idx > -1:
+            del session[address_found_idx]
+            session.append((now+datetime.timedelta(seconds=10), addr))
+            logger.info(f'server - session_id {session_id} received client with address: {addr} updating expiry')
+        else:
+            session.append((now+datetime.timedelta(seconds=10), addr))
+            logger.info(f'server - session_id {session_id} received client with address: {addr} new')
+        
+        while session and session[0][0] < now:
+            session.popleft()
+        if len(session) >= 2:
+            logger.info(f'server - session_id {session_id} paired and sending client info to: {session[0][1]}')
+            sock.sendto(addr_to_msg(session[1][1]), session[0][1])
+            logger.info(f'server - session_id {session_id} paired and sending client info to: {session[1][1]}')
+            sock.sendto(addr_to_msg(session[0][1]), session[1][1])
+            session.popleft()
+            session.popleft()
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+    main()
