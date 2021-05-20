@@ -481,7 +481,7 @@ def set_video_in(video_in, reset_video_source=True):
         set_video_source(video_source_option.variable.get())
 video_in_option = PlayerMenuOption(video_frame, 'Video In:', 'video_in', tkinter.StringVar, set_video_in, video_in_list, config_main['video_in'] if config_main['video_in'] in video_in_list else video_in_list[0])
 set_video_in(video_in_option.variable.get(), reset_video_source=False)
-video_source_list = webcam_capabilities.keys()
+video_source_list = list(webcam_capabilities.keys())
 if config_main['camera'] not in video_source_list:
     config_main['camera'] = video_source_list[0]
 if RASPBERRY_PI:
