@@ -455,37 +455,39 @@ def set_video_in(video_in, reset_video_source=True):
     if RASPBERRY_PI:
         webcam_capabilities = {'rpicamsrc': {'320x240': [30], '640x480': [30], '800x448': [30], '848x480': [30], '1280x720': [30], '1920x1080': [30]}}
     else:
-        p = subprocess.Popen(['v4l2-ctl', '--device', '/dev/video0', '--list-formats-ext'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output, err = p.communicate(b"")
-        rc = p.returncode
         webcam_capabilities = {}
-        matches = re.findall(rb'\[\d+\]: \'(?P<format>MJPG|\w+)\'|Size\: Discrete (?P<resolution>\d+x\d+)|(?P<fps>\d+.\d+) fps', output, re.DOTALL)
-        for t_format, t_resolution, t_fps in matches:
-            if t_format:
-                format = t_format.decode('utf8')
-                if format == 'MJPG':
-                    format = 'webcam-jpeg'
-                else:
-                    format = 'webcam'
-                if format not in webcam_capabilities:
-                    webcam_capabilities[format] = {}
-            elif t_resolution:
-                resolution = t_resolution.decode('utf8')
-                if resolution not in webcam_capabilities[format]:
-                    webcam_capabilities[format][resolution] = []
+    p = subprocess.Popen(['v4l2-ctl', '--device', '/dev/video0', '--list-formats-ext'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output, err = p.communicate(b"")
+    rc = p.returncode
+    webcam_capabilities = {}
+    matches = re.findall(rb'\[\d+\]: \'(?P<format>MJPG|\w+)\'|Size\: Discrete (?P<resolution>\d+x\d+)|(?P<fps>\d+.\d+) fps', output, re.DOTALL)
+    for t_format, t_resolution, t_fps in matches:
+        if t_format:
+            format = t_format.decode('utf8')
+            if format == 'MJPG':
+                format = 'webcam-jpeg'
             else:
-                assert t_fps
-                webcam_capabilities[format][resolution].append(float(t_fps.decode('utf8')))
+                format = 'webcam'
+            if format not in webcam_capabilities:
+                webcam_capabilities[format] = {}
+        elif t_resolution:
+            resolution = t_resolution.decode('utf8')
+            if resolution not in webcam_capabilities[format]:
+                webcam_capabilities[format][resolution] = []
+        else:
+            assert t_fps
+            webcam_capabilities[format][resolution].append(float(t_fps.decode('utf8')))
     print(webcam_capabilities)
     if reset_video_source:
         set_video_source(video_source_option.variable.get())
 video_in_option = PlayerMenuOption(video_frame, 'Video In:', 'video_in', tkinter.StringVar, set_video_in, video_in_list, config_main['video_in'] if config_main['video_in'] in video_in_list else video_in_list[0])
 set_video_in(video_in_option.variable.get(), reset_video_source=False)
+video_source_list = webcam_capabilities.keys()
+if config_main['camera'] not in video_source_list:
+    config_main['camera'] = video_source_list[0]
 if RASPBERRY_PI:
-    video_source_list = ['webcam', 'rpicamsrc']
     video_encoder_list = ['v4l2h264enc', 'x264', 'rpicamsrc']
 else:
-    video_source_list = ['webcam', 'webcam-jpeg']
     video_encoder_list = ['x264']
 def set_video_source(video_source):
     original_resolution = video_resolution_option.variable.get()

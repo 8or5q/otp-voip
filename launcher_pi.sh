@@ -35,7 +35,7 @@ x11docker --pw pkexec --no-entrypoint --sudouser \
   --env-file $HOME/Docker/otp-voip/pi.env \
   -- \
   otp-voip/otp-voip:pi-1.18.4-1.4.2-20210428 \
-  otp_voip_client
+  ~/shares/otp_voip_client
 ###BLOCK-COMMENT
 
 <<'###BLOCK-COMMENT'
