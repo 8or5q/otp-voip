@@ -16,7 +16,7 @@ do
   fi
 done
 
-<<'###BLOCK-COMMENT'
+#<<'###BLOCK-COMMENT'
 x11docker --pw pkexec --no-entrypoint --sudouser \
   --group-add video --group-add plugdev \
   --share $HOME/Downloads --share $HOME/Documents --share $HOME/Videos ${DEVICES} \
@@ -36,7 +36,7 @@ x11docker --pw pkexec --no-entrypoint --sudouser \
   python3 $HOME/shares/client.py
 ###BLOCK-COMMENT
 
-#<<'###BLOCK-COMMENT'
+<<'###BLOCK-COMMENT'
 x11docker --pw pkexec --interactive --no-entrypoint --sudouser \
   --group-add video --group-add plugdev \
   --share $HOME/Downloads --share $HOME/Documents --share $HOME/Videos ${DEVICES} \
