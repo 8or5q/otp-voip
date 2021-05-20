@@ -459,7 +459,6 @@ def set_video_in(video_in, reset_video_source=True):
     p = subprocess.Popen(['v4l2-ctl', '--device', '/dev/video0', '--list-formats-ext'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, err = p.communicate(b"")
     rc = p.returncode
-    webcam_capabilities = {}
     matches = re.findall(rb'\[\d+\]: \'(?P<format>MJPG|\w+)\'|Size\: Discrete (?P<resolution>\d+x\d+)|(?P<fps>\d+.\d+) fps', output, re.DOTALL)
     for t_format, t_resolution, t_fps in matches:
         if t_format:
