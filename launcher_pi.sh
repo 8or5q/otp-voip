@@ -17,7 +17,7 @@ do
 done
 
 #<<'###BLOCK-COMMENT'
-x11docker --pw pkexec --no-entrypoint --sudouser \
+x11docker --no-entrypoint --sudouser \
   --group-add video --group-add plugdev \
   --share $HOME/Downloads --share $HOME/Documents --share $HOME/Videos ${DEVICES} \
   --clipboard --nxagent --name otp-voip-001 \
@@ -39,7 +39,7 @@ x11docker --pw pkexec --no-entrypoint --sudouser \
 ###BLOCK-COMMENT
 
 <<'###BLOCK-COMMENT'
-x11docker --pw pkexec --interactive --no-entrypoint --sudouser \
+x11docker --interactive --no-entrypoint --sudouser \
   --group-add video --group-add plugdev \
   --share $HOME/Downloads --share $HOME/Documents --share $HOME/Videos ${DEVICES} \
   --clipboard --nxagent --name otp-voip-001 \

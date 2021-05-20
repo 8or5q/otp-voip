@@ -469,12 +469,12 @@ def set_video_in(video_in, reset_video_source=True):
                 format = 'webcam'
         elif t_resolution:
             resolution = t_resolution.decode('utf8')
-            if resolution not in webcam_capabilities[format]:
-                webcam_capabilities[format][resolution] = []
         else:
             assert t_fps
             if format not in webcam_capabilities:
                 webcam_capabilities[format] = {}
+            if resolution not in webcam_capabilities[format]:
+                webcam_capabilities[format][resolution] = []
             webcam_capabilities[format][resolution].append(float(t_fps.decode('utf8')))
     print(webcam_capabilities)
     if reset_video_source:
