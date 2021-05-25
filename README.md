@@ -45,15 +45,15 @@ sudo docker build -t otp-voip/otp-voip:amd64-1.18.4-1.4.2-20210428 -f Dockerfile
 ./install_pc.sh
 ```
 * If you install the package you can launch it with the required environment variables as follows.
-'''
+```
 ./run_pc.sh
-'''
+```
 
 ## UI Options
 The options are pretty hectic and the UI needs re-organization. I will update this with more specifics later.
 
 * I recommend you first do a loopback test by setting the following values.
-'''
+```
 Encryption -> Use Encryption: No
 Video -> Camera: webcam-jpeg (assuming your webcam supports JPEG mode, more modes will be supported later rpicamsrc should be used for the Raspberry PI camera)
 Video -> Video Encoder: x264 (x264 for PC or rpicamsrc for Raspberry PI camera)
@@ -67,17 +67,17 @@ General -> Video and Audio: both
 General -> Protocol: srt-direct (since we are testing loopback we can't use a proxy protocol type)
 General -> Embedded: yes
 General -> Loopback Mode: yes
-'''
+```
 Now plugin some headphones and click Start and confirm your audio and video are working.
 
 * I next recommend doing a direct connection test without encryption (if possible, if not skip to next test).
 Setup another PC identically to how you setup this one with the same settings as above, then change the settings you set above as follows on both systems.
-'''
+```
 General -> Direct Partner Address: the partner IP to connect to
 General -> Direct Partner Port: the partner port to connect to
 General -> Direct Local Port: the local port to receive connections on
 General -> Loopback Mode: no
-'''
+```
 Now plugin some headphones and click Start and confirm your audio and video are working on both systems.
 
 * I next recommend doing a proxy connection test without encryption.
@@ -85,22 +85,22 @@ This allows two systems both behind firewalls to connect to one another using UD
 It requires that you run the script "otp_voip_server" on a server with known public IP. (it should have minimum requirements except for python)
 It will listen on all interfaces on port 10000 by default, you can edit the script to change this if required.
 Once the server is running change the settings you set above as follows.
-'''
+```
 General -> Server Address: the IP address or domain name of the proxy server you setup above
 General -> Server Port: the port of the proxy server you setup above
 General -> Session Id: A string you will use on both clients the uniquely identify the session to allow them to pair together.
 General -> Protocol: srt-proxy
-'''
+```
 Now plugin some headphones and click Start and confirm your audio and video are working on both systems.
 
 * The last test is turning on encryption.
 This requires that you have two identical random data files on both clients and you will want ot ensure that the "OTP Out File" on one system is set as the "OTP In File" on the other system.
 The settings you will need to change are as follows.
-'''
+```
 Encryption -> Use Encryption: yes
 Encryption -> Select OTP Out File (be sure to use opposite files on opposite systems)
 Encryption -> Select OTP In File (be sure to use opposite files on opposite systems)
-'''
+```
 You should notice now that "OTP Out Position" on both systems in pointing to the last byte in each of the corresponding "OTP Out File", meanwhile "OTP In Position" is "999999999999999" as no connection has been established yet.
 Now plugin some headphones and click Start and confirm your audio and video are working on both systems.
 As the call progresses you should see the values for "OTP Out Position" and "OTP In Position" update every 5 seconds or so with a slowly decreasing value.
