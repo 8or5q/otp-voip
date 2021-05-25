@@ -22,7 +22,7 @@ The following instruction assumes you are building the amd64 PC variant but ther
 * Install [docker-ce](https://www.digitalocean.com/community/tutorials/how-to-install-and-use-docker-on-ubuntu-20-04)
 * Install nxagent
 * Install [x11docker](https://github.com/mviereck/x11docker)
-* Clone this repository to ~/Docker/otp-voip/ if you intend to use the docker launcher scripts as is.
+* Clone this repository to ~/Docker/otp-voip/ if you intend to use the docker test_pX.sh scripts as is.
 * Build the debian packages using the docker build image then copy the debian packages to the build folder (this builds a 4.5GB docker image).
 ```
 sudo docker build -t otp-voip/otp-voip-build:amd64-1.18.4-1.4.2-20210428 -f Dockerfile_pc_build_1.18.4 .
@@ -38,13 +38,20 @@ sudo docker build -t otp-voip/otp-voip:amd64-1.18.4-1.4.2-20210428 -f Dockerfile
 ```
 * Run the docker test image
 ```
-./launcher_pc.sh
-otp_proxy_client
+./test_pc.sh
 ```
-* Install the software from the packages you built, to do this just use the commands in Dockerfile_pc_1.18.4
+* If you so desire install the software from the packages you built, (beware this will uninstall potentially conflicting gstreamer packages if they are already installed, this may not be necessary so you may have luck removing the package exclusion policies and rebuilding if this is an issue.)
+```
+./install_pc.sh
+```
+* If you install the package you can launch it with the required environment variables as follows.
+'''
+./run_pc.sh
+'''
 
 ## UI Options
 The options are pretty hectic and the UI needs re-organization. I will update this with more specifics later.
+For now I've just attempted to highlight the role of various settings below.
 
 ## Random Number Generators
 ### Prebuilt RNG
