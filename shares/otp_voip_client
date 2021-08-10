@@ -120,7 +120,7 @@ otp_in_position = multiprocessing.Value(ctypes.c_ulonglong, 999999999999999)
 
 gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
-from gi.repository import Gst, GObject, GdkX11, GstVideo
+from gi.repository import Gst, GObject, GstVideo
 
 Gst.init(None)
 
@@ -649,6 +649,7 @@ def start_video():
         video_window.update()
 
     resolution_x, resolution_y = video_resolution_option.variable.get().split('x')
+    framerate = '%d/1' % webcam_capabilities[video_source_option.variable.get()][video_resolution_option.variable.get()][0]
 
     launch_command_parts = []
     mode = mode_option.variable.get()
@@ -684,7 +685,12 @@ def start_video():
             launch_command_parts.append(
                 f'udpsrc port={direct_local_port_entry.variable.get()} name=udpsrc0 '
             )
-    launch_command_parts.append(f'! queue ! tsparse ! tsdemux name=in ')
+    launch_command_parts.append(f'! queue ! tsparse ')
+    if RASPBERRY_PI:
+        launch_command_parts.append(f'! tsdemux name=in ') # on raspberry pi the default latency is overriden in the code
+    else:
+        launch_command_parts.append(f'! tsdemux latency=50 name=in ')
+
     
     if mode in ('video', 'both'):
         launch_command_parts.append(f'in. ! h264parse ! queue ') 
@@ -718,10 +724,10 @@ def start_video():
         if RASPBERRY_PI:        
             if video_source == 'webcam':
                 if video_encoder == 'v4l2h264enc':
-                    launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 io-mode=5 ! video/x-raw,width={resolution_x},height={resolution_y},framerate=30/1 ! v4l2h264enc output-io-mode=4 extra-controls="controls,video_bitrate={video_bitrate_option.variable.get()};" ')
+                    launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 io-mode=5 ! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! v4l2h264enc output-io-mode=4 extra-controls="controls,video_bitrate={video_bitrate_option.variable.get()};" ')
                 else:
                     assert video_encoder == 'x264'
-                    launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 ! video/x-raw,width={resolution_x},height={resolution_y},framerate=30/1 ! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate_option.variable.get()/1000)} speed-preset=superfast ')
+                    launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 ! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate_option.variable.get()/1000)} speed-preset=superfast ')
             else:
                 assert video_source == 'rpicamsrc'
                 assert video_encoder == 'rpicamsrc'
@@ -729,12 +735,12 @@ def start_video():
         else:
             launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 ')
             if video_source == 'webcam':
-                #launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate=30/1 ! videoconvert ')
-                launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate=30/1 ! videoconvert ! video/x-raw,format=I420 ')
+                #launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! videoconvert ')
+                launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! videoconvert ! video/x-raw,format=I420 ')
             else:
                 assert video_source == 'webcam-jpeg'
-                #launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate=30/1 ! jpegdec ')
-                launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate=30/1 ! jpegdec ! videoconvert ! video/x-raw,format=I420 ')
+                #launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} ! jpegdec ')
+                launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} ! jpegdec ! videoconvert ! video/x-raw,format=I420 ')
             assert video_encoder == 'x264'
             launch_command_parts.append(f'! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate_option.variable.get()/1000)} speed-preset=superfast ')
         launch_command_parts.append(f'! queue ! h264parse config-interval=1 ! out. ')

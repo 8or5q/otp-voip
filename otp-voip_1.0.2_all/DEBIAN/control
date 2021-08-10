@@ -1,0 +1,9 @@
+Package: otp-voip
+Version: 1.0.0
+Architecture: all
+Essential: no
+Priority: optional
+Depends: libsrt1.4-openssl (>=1.4.0), libwebrtc-audio-processing1 (>=0.3.1), gstreamer1.0-alsa, gstreamer1.0-gl, gstreamer1.0-libav, gstreamer1.0-nice, gstreamer1.0-plugins-bad (>=1.18.4), gstreamer1.0-plugins-good, gstreamer1.0-plugins-ugly, gstreamer1.0-plugins-rtp, gstreamer1.0-pulseaudio, gstreamer1.0-python3-plugin-loader, gstreamer1.0-rtsp, gstreamer1.0-tools, gstreamer1.0-vaapi, gstreamer1.0-x, python3-tk, v4l-utils, libatlas3-base, python3-pip
+Maintainer: 76275385+8or5q@users.noreply.github.com
+Description: A point to point video and voice chat package supporting one-time-pad built on gstreamer with srt.
+

@@ -1,4 +1,9 @@
-*/*.deb
+*/gstream*.deb
+*/srt*.deb
+*/webrtc*.deb
+*/*/gstream*.deb
+*/*/srt*.deb
+*/*/webrtc*.deb
 */*.ini
 */*.rnd
 .otp_client/*
