@@ -16,7 +16,7 @@ do
   fi
 done
 
-#<<'###BLOCK-COMMENT'
+<<'###BLOCK-COMMENT'
 x11docker --no-entrypoint --sudouser \
   --group-add video --group-add plugdev \
   --share $HOME/Downloads --share $HOME/Documents --share $HOME/Videos ${DEVICES} \
@@ -31,11 +31,11 @@ x11docker --no-entrypoint --sudouser \
   --volume /media/:/media/ \
   --rm \
   -- \
-  otp-voip/otp-voip:amd64-ubuntu-lite-1.18.4-1.4.2-20210428 \
+  otp-voip/otp-voip:amd64-ubuntu-21.04 \
   ~/shares/otp_voip_client
 ###BLOCK-COMMENT
 
-<<'###BLOCK-COMMENT'
+#<<'###BLOCK-COMMENT'
 x11docker --interactive --no-entrypoint --sudouser \
   --group-add video --group-add plugdev \
   --share $HOME/Downloads --share $HOME/Documents --share $HOME/Videos ${DEVICES} \
@@ -50,7 +50,7 @@ x11docker --interactive --no-entrypoint --sudouser \
   --volume /media/:/media/ \
   --rm \
   -- \
-  otp-voip/otp-voip:amd64-ubuntu-lite-1.18.4-1.4.2-20210428 \
+  otp-voip/otp-voip:amd64-ubuntu-21.04 \
   /bin/bash
 ###BLOCK-COMMENT
   
@@ -58,4 +58,5 @@ exit
 
 # install docker https://www.digitalocean.com/community/tutorials/how-to-install-and-use-docker-on-ubuntu-20-04
 # install nxagent
+
 

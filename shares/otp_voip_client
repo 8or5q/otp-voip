@@ -1,834 +1,1683 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import ctypes
-import tkinter
-from tkinter import filedialog
+import asyncio
+from asyncio.base_events import BaseEventLoop
+from asyncio.tasks import Task
+import collections  # @UnusedImport
+import copy
+import datetime
+import functools
 import gi
 import glob
-import functools
-import multiprocessing
-import socket
-import time
-import queue
-import numpy
 import hashlib
-import collections
-import subprocess
-import configparser
-import pulsectl
 import json
-import traceback
+import layoutx
+from layoutx.store import create_store
+from layoutx.view import View, ResizeOption  # @UnusedImport
+from layoutx.widgets import Widget
+import logging  # @UnusedImport
+import multiprocessing
+import numpy
+import os
+import pulsectl
+from pyshmht3 import HashTable
 import re
+import shutil
+import socket
+import subprocess
+import threading
+import time
+import traceback  # @UnusedImport
+from uuid import uuid4
 
-#APP_SETTINGS_PATH = os.path.dirname(__file__)
+
 APP_SETTINGS_PATH = os.path.expanduser('~/.otp_client/')
-if not os.path.exists(APP_SETTINGS_PATH):
-    os.mkdir(APP_SETTINGS_PATH)
-INI_FILE_NAME = 'config.ini'
-AUTOCALL_PIN = 18
-SHUTDOWN_PIN = 23
+SETTINGS_FILE_PATH = os.path.join(APP_SETTINGS_PATH, 'config.json')
+
 if os.path.exists('/opt/vc/bin/raspivid'):
-    RASPBERRY_PI = True
-    try:
-        import RPi.GPIO as GPIO
-        GPIO.setmode(GPIO.BCM)    
-        GPIO.setup(AUTOCALL_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)  
-        GPIO.setup(SHUTDOWN_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) 
-        RASPBERRY_PI_GPIO = True
-    except Exception:
-        traceback.print_exc()
-        RASPBERRY_PI_GPIO = False
+  RASPBERRY_PI = True
 else:
-    RASPBERRY_PI = False
-    RASPBERRY_PI_GPIO = False
-
-do_autocall = RASPBERRY_PI_GPIO and (GPIO.input(AUTOCALL_PIN) == 0)
-do_shutdown = RASPBERRY_PI_GPIO and (GPIO.input(SHUTDOWN_PIN) == 0)
-if do_autocall:
-    time.sleep(5) # wait for network interfaces and os to stabalize
-
-# globals
-player = None
-video_window = None
-player_process = None
-proxy_ready = multiprocessing.Value(ctypes.c_bool, False)
-proxy_stop = multiprocessing.Value(ctypes.c_bool, False)
-proxy_process = None
-close_client = False
-config = configparser.ConfigParser()
-if not os.path.exists(os.path.join(APP_SETTINGS_PATH, 'out.rnd')):
-    with open(os.path.join(APP_SETTINGS_PATH, 'out.rnd'), 'wb') as fout:
-        fout.write(os.urandom(10000000))
-if not os.path.exists(os.path.join(APP_SETTINGS_PATH, 'in.rnd')):
-    with open(os.path.join(APP_SETTINGS_PATH, 'in.rnd'), 'wb') as fout:
-        fout.write(os.urandom(10000000))
-if not os.path.exists(os.path.join(APP_SETTINGS_PATH, INI_FILE_NAME)):
-    config.read_dict(
-        {
-            'main': 
-            {
-                'embedded': 'yes',
-                'latency': '400',
-                'encryption': 'yes',
-                'camera': 'webcam-jpeg',
-                'video_encoder': 'x264',
-                'resolution': '1280x720',
-                'echo_cancellation': 'yes',
-                'auto_white_balance': 'incadescent',
-                'video_bitrate': '524288',
-                'audio_bitrate': '16384',
-                'otp_out_positions': json.dumps(
-                        {
-                            os.path.join(APP_SETTINGS_PATH, 'out.rnd'): 
-                            os.path.getsize(os.path.join(APP_SETTINGS_PATH, 'out.rnd'))
-                        }
-                    ),
-                'otp_out_file': os.path.join(APP_SETTINGS_PATH, 'out.rnd'),
-                'otp_in_file': os.path.join(APP_SETTINGS_PATH, 'in.rnd'),
-                'udp_hole_puncher_server_address': 'yourserver.com',
-                'udp_hole_puncher_server_port': 10000,
-                'udp_hole_puncher_session_id': 'some_id_to_uniquely_identify_two_users_seeking_each_other',
-                'protocol': 'srt-proxy',
-                'direct_partner_address': '192.168.1.2',
-                'direct_partner_port': '9998',
-                'direct_local_port': '9999',
-                'loopback_mode': 'no',
-                'audio_in': '',
-                'audio_out': '',
-                'video_in': '/dev/video0',
-            },
-        }
-    )
-    with open(os.path.join(APP_SETTINGS_PATH, INI_FILE_NAME), 'w') as config_file:
-        config.write(config_file)
-else:
-    config.read(os.path.join(APP_SETTINGS_PATH, INI_FILE_NAME))
-print({section: dict(config[section]) for section in config.sections()})
-config_main = config['main']
-otp_out_positions = json.loads(config_main['otp_out_positions'])
-if os.path.exists(config_main['otp_out_file']):
-    if config_main['otp_out_file'] not in otp_out_positions:
-        otp_out_positions[config_main['otp_out_file']] = os.path.getsize(config_main['otp_out_file'])
-    temp_otp_out_position = otp_out_positions[config_main['otp_out_file']]
-else:
-    temp_otp_out_position = 0
-print(f'Read OTP Out Position {temp_otp_out_position}')
-otp_out_position = multiprocessing.Value(ctypes.c_ulonglong, temp_otp_out_position)
-otp_in_position = multiprocessing.Value(ctypes.c_ulonglong, 999999999999999)
+  RASPBERRY_PI = False
 
 gi.require_version('Gst', '1.0')
-gi.require_version('GstVideo', '1.0')
-from gi.repository import Gst, GObject, GstVideo
-
+gi.require_version('GstGL', '1.0')
+from gi.repository import Gst, GstGL  # @NoMove @UnusedImport
 Gst.init(None)
 
 pulse = pulsectl.Pulse('my-client-name')
 
-# import os
-# with open(config_main['otp_out_file'], 'wb') as fout:
-#     fout.write(os.urandom(50*1024*1024))
+# globals
+close_client = False
+
+integrity_lock = threading.Lock()
+shared_memory_lock = multiprocessing.Lock()
+shared_memory = HashTable('tmp', 1000000)
+
+# otp proxy
 
 class OTPProxy(object):
-    
-    LENGTH_SIZE = 4
-    POSITION_SIZE = 8
-    NONCE_SIZE = 4
-    HASH_SIZE = 20
-    MESSAGE_OVERHEAD_SIZE = LENGTH_SIZE+POSITION_SIZE+NONCE_SIZE+HASH_SIZE
-    HASH_OFFSET = LENGTH_SIZE+POSITION_SIZE
-    NONCE_OFFSET = HASH_OFFSET+HASH_SIZE
-    MESSAGE_OFFSET = NONCE_OFFSET+NONCE_SIZE
-    #TRUNCATE_EVERY_N_BYTES = 2*1024*1024
-    UPDATE_GLOBAL_OTP_POSITIONS_EVERY_N_SECONDS = 5
-    IN_TRUNCATE_GRACE_WINDOW = 2*1024*1024 # facilitates udp packet out of ordering.
-    
+  active_proxy_processes = dict()
 
-    def __init__(self):
-        global otp_out_position, config
-        out_path = config_main['otp_out_file']
-        in_path = config_main['otp_in_file']
-        self.output = open(out_path, mode='r+b', buffering=1)
-        self.output_position = otp_out_position.value
-        #self.output_next_truncate_position = self.output_position - self.output_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
-        self.input = open(in_path, mode='r+b', buffering=1)
-        self.input_min_position = None
-        #self.input_next_truncate_position = None
-        self.update_global_otp_positions_at_time = time.time() + 5
-        self.input_file_size = os.path.getsize(in_path)
-        #self.encrypt_durations = collections.defaultdict(int)
-        #self.decrypt_durations = collections.defaultdict(int)
+  LENGTH_SIZE = 4
+  POSITION_SIZE = 8
+  NONCE_SIZE = 4
+  HASH_SIZE = 20
+  MESSAGE_OVERHEAD_SIZE = LENGTH_SIZE+POSITION_SIZE+NONCE_SIZE+HASH_SIZE
+  HASH_OFFSET = LENGTH_SIZE+POSITION_SIZE
+  NONCE_OFFSET = HASH_OFFSET+HASH_SIZE
+  MESSAGE_OFFSET = NONCE_OFFSET+NONCE_SIZE
+  #TRUNCATE_EVERY_N_BYTES = 2*1024*1024
+  UPDATE_GLOBAL_OTP_POSITIONS_EVERY_N_SECONDS = 5
+  IN_TRUNCATE_GRACE_WINDOW = 2*1024*1024 # facilitates udp packet out of ordering.
 
-    def encrypt(self, message):
-        global otp_out_position
-        message_size = len(message)
-        read_size = 2*OTPProxy.NONCE_SIZE + OTPProxy.HASH_SIZE + message_size
-        packed_size = message_size + OTPProxy.MESSAGE_OVERHEAD_SIZE
-        self.output_position -= read_size
-        self.output.seek(self.output_position)
-        #start_time = time.time()
-        otp_data = self.output.read(read_size)
-        #duration = time.time() - start_time
-        #rounded_duration = round(duration,2)
-        #self.encrypt_durations[rounded_duration] += 1
-        #if duration > 0.05:
-        #    print('enc\n' + '\n'.join(f'{k}: {self.encrypt_durations[k]}' for k in sorted(self.encrypt_durations.keys())))
-        #if self.output_position < self.output_next_truncate_position:
-        #    truncate_to = self.output_position - self.output_position % -OTPProxy.TRUNCATE_EVERY_N_BYTES
-        #    print(f"out {self.output_position} {truncate_to}")
-        #    self.output.truncate(truncate_to)
-        #    self.output_next_truncate_position = truncate_to - OTPProxy.TRUNCATE_EVERY_N_BYTES
-        
-        result = []
-        result.append(message_size.to_bytes(4, byteorder="little", signed=False))
-        result.append(self.output_position.to_bytes(8, byteorder="little", signed=False))
-        part_to_hash = otp_data[0:OTPProxy.NONCE_SIZE] + message
-        part_to_encrypt = hashlib.sha1(part_to_hash).digest() + part_to_hash
-        result.append(numpy.bitwise_xor(
-            numpy.frombuffer(otp_data[OTPProxy.NONCE_SIZE:read_size], dtype=numpy.ubyte),
-            numpy.frombuffer(part_to_encrypt, dtype=numpy.ubyte)
-        ).tobytes())
-        return b''.join(result)
+  def __init__(self, session_id):
+    self.__session_id = session_id
+    with shared_memory_lock:
+      self.__encryption = shared_memory.get(f'{session_id}.encryption') == b'true'
+      self.__otp_in_file = shared_memory.getobj(f'{session_id}.otp_in_file')
+      self.__otp_out_file = shared_memory.getobj(f'{session_id}.otp_out_file')
+      self.__output_position = shared_memory.getobj(f'{session_id}.otp_out_positions')[self.__otp_out_file]
+      self.__local_relay_address = shared_memory.getobj(f'{session_id}.local_relay_address')
+      self.__local_listen_address = shared_memory.getobj(f'{session_id}.local_listen_address')
+      self.__server_address = shared_memory.getobj(f'{session_id}.server_address')
+    if self.__encryption:
+      self.__output = open(self.__otp_out_file, mode='r+b', buffering=1)
+      #self.__output_next_truncate_position = self.__output_position - self.__output_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
+      self.__input = open(self.__otp_in_file, mode='r+b', buffering=1)
+      self.__input_min_position = None
+      #self.__input_next_truncate_position = None
+      self.__update_global_otp_positions_at_time = time.time() + 5
+      self.__input_file_size = os.path.getsize(self.__otp_in_file)
+      #self.__encrypt_durations = collections.defaultdict(int)
+      #self.__decrypt_durations = collections.defaultdict(int)
 
-    def decrypt(self, message):
-        global otp_in_position
-        message_size = int.from_bytes(message[0:OTPProxy.LENGTH_SIZE], byteorder='little', signed=False)
-        read_size = 2*OTPProxy.NONCE_SIZE + OTPProxy.HASH_SIZE + message_size
-        packed_size = message_size + OTPProxy.MESSAGE_OVERHEAD_SIZE
-        position = int.from_bytes(message[OTPProxy.LENGTH_SIZE:OTPProxy.HASH_OFFSET], byteorder='little', signed=False)
-        if position + read_size > self.input_file_size:
-            print('position too high %r' % (position, read_size, self.input_file_size))
-            return 'position too high', b''
-        if self.input_min_position is None:
-            self.input_min_position = position
-        #    self.input_next_truncate_position = self.input_min_position - self.input_min_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
-        elif position < self.input_min_position:
-            self.input_min_position = position
-        self.input.seek(position)
-        #start_time = time.time()
-        otp_data = self.input.read(read_size)
-        #duration = time.time() - start_time
-        #rounded_duration = round(duration,2)
-        #self.decrypt_durations[rounded_duration] += 1
-        #if duration > 0.05:
-        #    print('dec\n' + '\n'.join(f'{k}: {self.decrypt_durations[k]}' for k in sorted(self.decrypt_durations.keys())))
-        decrypted_part = numpy.bitwise_xor(
-            numpy.frombuffer(otp_data[OTPProxy.NONCE_SIZE:read_size], dtype=numpy.ubyte),
-            numpy.frombuffer(message[OTPProxy.HASH_OFFSET:packed_size], dtype=numpy.ubyte)
-        ).tobytes()
-        if decrypted_part[OTPProxy.HASH_SIZE:OTPProxy.HASH_SIZE+OTPProxy.NONCE_SIZE] != otp_data[0:OTPProxy.NONCE_SIZE]:
-            print('bad nonce %r' % (decrypted_part[OTPProxy.HASH_SIZE:OTPProxy.HASH_SIZE+OTPProxy.NONCE_SIZE], otp_data[0:OTPProxy.NONCE_SIZE]))
-            return 'bad nonce', b''
-        if decrypted_part[0:OTPProxy.HASH_SIZE] != hashlib.sha1(decrypted_part[OTPProxy.HASH_SIZE:]).digest():
-            print('bad hash %r' % (decrypted_part[0:OTPProxy.HASH_SIZE], hashlib.sha1(decrypted_part[OTPProxy.HASH_SIZE:]).digest()))
-            return 'bad hash', b''
-        # only truncate after validation is complete
-        #if self.input_min_position < self.input_next_truncate_position and self.input_next_truncate_position < self.input_file_size:
-        #    if self.input_next_truncate_position + OTPProxy.IN_TRUNCATE_GRACE_WINDOW < self.input_file_size:
-        #        self.input_file_size = self.input_next_truncate_position + OTPProxy.IN_TRUNCATE_GRACE_WINDOW
-        #        print(f"in {self.input_file_size}")
-        #        self.input.truncate(self.input_file_size)
-        #    self.input_next_truncate_position = self.input_min_position - self.input_min_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
-        return None, decrypted_part[OTPProxy.NONCE_SIZE+OTPProxy.HASH_SIZE:]
+  @staticmethod
+  def create_proxy_task(store, loop: BaseEventLoop)->Task:
+    async def proxy_updater(interval):
+      while True:
+        connections = store.state['settings']['connections']
+        if connections:
+          OTPProxy.update_otp_in_out_positions(connections)
+        await asyncio.sleep(interval)
+    return loop.create_task(proxy_updater(1))
 
-    def cleanup(self):
-        pass
-        #print('enc\n' + '\n'.join(f'{k}: {self.encrypt_durations[k]}' for k in sorted(self.encrypt_durations.keys())))
-        #print('dec\n' + '\n'.join(f'{k}: {self.decrypt_durations[k]}' for k in sorted(self.decrypt_durations.keys())))
-        #print(f"out {self.output_position}")
-        #self.output.truncate(self.output_position)
-        #if self.input_min_position is not None:
-        #    print(f"in {self.input_min_position}")
-        #    self.input.truncate(self.input_min_position)
+  @staticmethod
+  def launch(session_id, connection, encryption, local_relay_address, local_listen_address, server_address):
+    assert session_id not in OTPProxy.active_proxy_processes
+    with shared_memory_lock:
+      shared_memory.update({
+        f'{session_id}.proxy_ready': b'false',
+        f'{session_id}.proxy_stop': b'false',
+        f'{session_id}.encryption': b'true' if encryption else b'false',
+      })
+      shared_memory.setobj(f'{session_id}.otp_in_file', connection['otp_in_file'])
+      shared_memory.setobj(f'{session_id}.otp_in_positions', connection['otp_in_positions'])
+      shared_memory.setobj(f'{session_id}.otp_out_file', connection['otp_out_file'])
+      shared_memory.setobj(f'{session_id}.otp_out_positions', connection['otp_out_positions'])
+      shared_memory.setobj(f'{session_id}.local_relay_address', local_relay_address)
+      shared_memory.setobj(f'{session_id}.local_listen_address', local_listen_address)
+      shared_memory.setobj(f'{session_id}.server_address', server_address)
+    proxy_process = multiprocessing.Process(
+      target=OTPProxy.run,
+      kwargs={'session_id': session_id}
+    )
+    OTPProxy.active_proxy_processes[session_id] = proxy_process
+    proxy_process.start()
 
-    @staticmethod
-    def run(local_relay_address=('127.0.0.1', 9998), local_listen_address=('0.0.0.0', 9999), server_address=('yourserver.com', 10000), session_id=b'yoursession', use_encryption=False):
-        
-        global proxy_ready, proxy_stop
-        
-        sock_local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock_local.bind(local_listen_address)
-        print("local_listen_address: " + repr(local_listen_address))
-        sock_local.settimeout(None)
-        while True:
-            sock_local.sendto(session_id, server_address)
-            sock_local.settimeout(2)
-            try:
-                remote_data, server_address = sock_local.recvfrom(4096)
-                break
-            except socket.timeout:
-                time.sleep(1)
-            if proxy_stop.value:
-                return
-        remote_ip, remote_port = remote_data.decode('utf-8').strip().split(':')
-        remote_address = (remote_ip, int(remote_port))
-        print("remote_address: " + repr(remote_address))
-                
-        otp_proxy = OTPProxy()
-        proxy_ready.value = True
-        sock_local.settimeout(1)
-        print("ready")
-        try:
-            while not proxy_stop.value:
-                try:
-                    data, address = sock_local.recvfrom(4096)
-                    #print("data in")
-                except socket.timeout:
-                    continue
-                if not data:
-                    print("*")
-                    break
-                error = None
-                if address[0] == local_relay_address[0]:
-                    target_address = remote_address
-                    if use_encryption:
-                        data = otp_proxy.encrypt(data)
-                    #print(f'outbound sending {data} from {address} to {target_address}')
-                    sock_local.sendto(data, target_address)
-                elif address[0] == remote_address[0]:
-                    target_address = local_relay_address
-                    if use_encryption:
-                        error, data = otp_proxy.decrypt(data)
-                        if error is not None:
-                            print(f'error decrypting "{error}" dropping packet')
-                    if error is None:
-                        #print(f'inbound sending {data} from {address} to {target_address}')
-                        sock_local.sendto(data, target_address)
-                else:
-                    print(f'Unexpected address {address} no known target.')
-                if time.time() > otp_proxy.update_global_otp_positions_at_time:
-                    otp_out_position.value = otp_proxy.output_position
-                    otp_in_position.value = otp_proxy.input_min_position if otp_proxy.input_min_position is not None else 999999999999999
-                    otp_proxy.update_global_otp_positions_at_time = time.time() + 5
-        finally:
-            otp_proxy.cleanup()
-            otp_out_position.value = otp_proxy.output_position
-            otp_in_position.value = otp_proxy.input_min_position if otp_proxy.input_min_position is not None else 999999999999999
+  @staticmethod
+  def update_otp_in_out_positions(connections):
+    for connection in connections:
+      if connection['shared_session_id'] in OTPProxy.active_proxy_processes:
+        connection['otp_in_positions'] = shared_memory.getobj(f'''{connection['shared_session_id']}.otp_in_positions''')
+        connection['otp_out_positions'] = shared_memory.getobj(f'''{connection['shared_session_id']}.otp_out_positions''')
 
-controls = tkinter.Tk()
-controls.geometry("+360+40")
-controls.attributes('-topmost', True)
-controls.update()
-
-def set_option(pad_name, property_name, value, lookup=None):
-    global player
-    if player is None:
-        return
-    if pad_name == 'rpicamsrc0' and video_source_option.variable.get() in ('webcam', 'webcam-jpeg'):
-        return
-    if lookup is not None:
-        value = lookup[value]
-    player.get_child_by_name(pad_name).set_property(property_name, value)
-
-class PlayerMenuOption(object):
-    def __init__(self, parent, label, config_name, inter_type, set_func, options, default):
-        self.label = tkinter.Label(parent, text=label)
-        self.label.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
-        self.variable = inter_type(parent)
-        self.variable.set(default) 
-        def set_callback(*args):
-            global config_main
-            if config_name is not None:
-                config_main[config_name] = str(self.variable.get())
-            if set_func is not None:
-                set_func(self.variable.get())
-        self.variable.trace("w", set_callback)
-        self.option_menu = tkinter.OptionMenu(parent, self.variable, *options)
-        self.option_menu.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
-
-class PlayerEntry(object):
-    def __init__(self, parent, label, config_name, inter_type, set_func):
-        self.label = tkinter.Label(parent, text=label)
-        self.label.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
-        self.variable = inter_type(parent)
-        if config_name is not None:
-            self.variable.set(config_main[config_name])
-        def set_callback(*args):
-            global config_main
-            if config_name is not None:
-                config_main[config_name] = str(self.variable.get())
-            if set_func is not None:
-                set_func(self.variable.get())
-        self.variable.trace("w", set_callback)
-        self.entry = tkinter.Entry(parent, textvariable=self.variable)
-        self.entry.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
-
-def create_toggled_frame(parent, text, expanded=False):
-    top_frame = tkinter.Frame(parent, relief="raised", borderwidth=1)
-    top_frame.pack(fill="x", expand=1, pady=2, padx=2, anchor="n")
-    title_frame = tkinter.Frame(top_frame)
-    title_frame.pack(fill="x", expand=1)
-    tkinter.Label(title_frame, text=text).pack(side="left", fill="x", expand=1)
-
-    def toggle():
-        if expanded_.get() == 1:
-            expanded_.set(0)
-            sub_frame.forget()
-            toggle_button.configure(text="+")
-        else:
-            expanded_.set(1)
-            sub_frame.pack(padx=3, pady=3, fill="x", expand=1)
-            toggle_button.configure(text="-")
-
-    toggle_button = tkinter.Button(title_frame, width=2, text="+", command=toggle)
-    toggle_button.pack(side="left")
-    sub_frame = tkinter.Frame(top_frame, relief="sunken", borderwidth=1)
-    expanded_ = tkinter.IntVar(master=parent)
-    if expanded:
-        expanded_.set(1)
-        sub_frame.pack(padx=3, pady=3, fill="x", expand=1)
-        toggle_button.configure(text="-")
-    else:
-        expanded_.set(0)
-    return sub_frame
-        
-# Encryption
-encryption_frame = create_toggled_frame(controls, 'Encryption', False)
-use_encryption_option = PlayerMenuOption(encryption_frame, 'Use Encryption:', 'encryption', tkinter.StringVar, None, ['yes', 'no'], config_main['encryption'])
-def store_otp_positions():
-    global otp_out_position
-    config_main['otp_out_positions'] = json.dumps(otp_out_positions)
-def select_otp_out_file():
-    new_otp_out_file = filedialog.askopenfilename(initialdir="/", title="Select OTP Out file", filetypes=(("random data file","*.rnd"),("all files","*.*")))
-    if new_otp_out_file:
-        global otp_out_position
-        otp_out_positions[config_main['otp_out_file']] = otp_out_position.value
-        config_main['otp_out_file'] = new_otp_out_file
-        otp_out_file_entry.variable.set(config_main['otp_out_file'])
-        if config_main['otp_out_file'] not in otp_out_positions:
-            otp_out_positions[config_main['otp_out_file']] = os.path.getsize(config_main['otp_out_file'])
-        otp_out_position.value = otp_out_positions[config_main['otp_out_file']]
-        update_otp_positions()
-        store_otp_positions()
-otp_out_select_file_button = tkinter.Button(encryption_frame, text='Select OTP Out File', command=select_otp_out_file)
-otp_out_select_file_button.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
-otp_out_file_entry = PlayerEntry(encryption_frame, 'OTP Out File', 'otp_out_file', tkinter.StringVar, None)
-otp_out_file_entry.variable.set(config_main['otp_out_file'])
-def set_otp_out_position(position):
-    global otp_out_position
-    otp_out_position.value = position
-    otp_out_positions[config_main['otp_out_file']] = otp_out_position.value
-    store_otp_positions()
-otp_out_position_entry = PlayerEntry(encryption_frame, 'OTP Out Position', None, tkinter.IntVar, set_otp_out_position)
-def truncate_otp_out_position():
-    global otp_out_position
-    otp_out_positions[config_main['otp_out_file']] = otp_out_position.value
-    if otp_out_position.value < os.path.getsize(config_main['otp_out_file']):
-        otp_data = open(config_main['otp_out_file'], mode='r+b', buffering=1)
-        otp_data.truncate(otp_out_position.value)
-        otp_data.close()
-otp_out_position_truncate_button = tkinter.Button(encryption_frame, text='Truncate OTP Out', command=truncate_otp_out_position)
-otp_out_position_truncate_button.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
-def select_otp_in_file():
-    new_otp_in_file = filedialog.askopenfilename(initialdir="/", title="Select OTP In file", filetypes=(("random data file","*.rnd"),("all files","*.*")))
-    if new_otp_in_file:
-        config_main['otp_in_file'] = new_otp_in_file
-        otp_in_file_entry.variable.set(config_main['otp_in_file'])
-otp_in_select_file_button = tkinter.Button(encryption_frame, text='Select OTP In File', command=select_otp_in_file)
-otp_in_select_file_button.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
-otp_in_file_entry = PlayerEntry(encryption_frame, 'OTP In File', 'otp_in_file', tkinter.StringVar, None)
-otp_in_file_entry.variable.set(config_main['otp_in_file'])
-def update_otp_positions():
-    global otp_out_position, otp_in_position
-    otp_out_positions[config_main['otp_out_file']] = otp_out_position.value
-    if otp_out_position.value != otp_out_position_entry.variable.get():
-        otp_out_position_entry.variable.set(otp_out_position.value)
-    if otp_in_position.value != otp_in_position_entry.variable.get():
-        otp_in_position_entry.variable.set(otp_in_position.value)
-otp_in_position_entry = PlayerEntry(encryption_frame, 'OTP In Position', None, tkinter.IntVar, None)
-def truncate_otp_in_position():
-    global otp_in_position
-    if otp_in_position.value < os.path.getsize(config_main['otp_in_file']):
-        otp_data = open(config_main['otp_in_file'], mode='r+b', buffering=1)
-        otp_data.truncate(otp_in_position.value)
-        otp_data.close()
-otp_in_position_truncate_button = tkinter.Button(encryption_frame, text='Truncate OTP In', command=truncate_otp_in_position)
-otp_in_position_truncate_button.pack(side=tkinter.TOP,expand=tkinter.YES,fill=tkinter.BOTH)
-update_otp_positions()
-
-# Video
-video_frame = create_toggled_frame(controls, 'Video', False)
-video_in_list = glob.glob('/dev/video*')
-def set_video_in(video_in, reset_video_source=True):
-    global webcam_capabilities
-    if RASPBERRY_PI:
-        webcam_capabilities = {'rpicamsrc': {'320x240': [30], '640x480': [30], '800x448': [30], '848x480': [30], '1280x720': [30], '1920x1080': [30]}}
-    else:
-        webcam_capabilities = {}
-    p = subprocess.Popen(['v4l2-ctl', '--device', video_in, '--list-formats-ext'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output, err = p.communicate(b"")
-    rc = p.returncode
-    matches = re.findall(rb'\[\d+\]: \'(?P<format>MJPG|\w+)\'|Size\: Discrete (?P<resolution>\d+x\d+)|(?P<fps>\d+.\d+) fps', output, re.DOTALL)
-    for t_format, t_resolution, t_fps in matches:
-        if t_format:
-            format = t_format.decode('utf8')
-            if format == 'MJPG':
-                format = 'webcam-jpeg'
-            else:
-                format = 'webcam'
-        elif t_resolution:
-            resolution = t_resolution.decode('utf8')
-        else:
-            assert t_fps
-            if format not in webcam_capabilities:
-                webcam_capabilities[format] = {}
-            if resolution not in webcam_capabilities[format]:
-                webcam_capabilities[format][resolution] = []
-            webcam_capabilities[format][resolution].append(float(t_fps.decode('utf8')))
-    print(webcam_capabilities)
-    if reset_video_source:
-        set_video_source(video_source_option.variable.get())
-video_in_option = PlayerMenuOption(video_frame, 'Video In:', 'video_in', tkinter.StringVar, set_video_in, video_in_list, config_main['video_in'] if config_main['video_in'] in video_in_list else video_in_list[0])
-set_video_in(video_in_option.variable.get(), reset_video_source=False)
-video_source_list = list(webcam_capabilities.keys())
-if config_main['camera'] not in video_source_list:
-    config_main['camera'] = video_source_list[0]
-if RASPBERRY_PI:
-    video_encoder_list = ['v4l2h264enc', 'x264', 'rpicamsrc']
-else:
-    video_encoder_list = ['x264']
-def set_video_source(video_source):
-    original_resolution = video_resolution_option.variable.get()
-    video_resolution_option.variable.set('')
-    video_resolution_option.option_menu['menu'].delete(0, 'end')
-    for resolution in webcam_capabilities[video_source].keys():
-        video_resolution_option.option_menu['menu'].add_command(label=resolution, command=tkinter._setit(video_resolution_option.variable, resolution))
-    if original_resolution in webcam_capabilities[video_source].keys():
-        video_resolution_option.variable.set(original_resolution) 
-    else:
-        video_resolution_option.variable.set(list(webcam_capabilities[video_source].keys())[0])
-video_source_option = PlayerMenuOption(video_frame, 'Camera:', 'camera', tkinter.StringVar, set_video_source, video_source_list, config_main['camera'])
-video_encoder_option = PlayerMenuOption(video_frame, 'Video Encoder:', 'video_encoder', tkinter.StringVar, None, video_encoder_list, config_main['video_encoder'])
-video_resolution_option = PlayerMenuOption(video_frame, 'Resolution:', 'resolution', tkinter.StringVar, None, webcam_capabilities[video_source_option.variable.get()].keys(), config_main['resolution'] if config_main['resolution'] in webcam_capabilities[video_source_option.variable.get()].keys() else list(webcam_capabilities[video_source_option.variable.get()].keys())[0])
-awb_modes = {'off':0,'auto':1,'sunlight':2,'cloudy':3,'shade':4,'tungsten':5,'fluorescent':6,'incadescent':7,'flash':8,'horizon':9}
-video_awb_option = PlayerMenuOption(video_frame, 'AWB:', 'auto_white_balance', tkinter.StringVar, functools.partial(set_option, 'rpicamsrc0', 'awb-mode', lookup=awb_modes), awb_modes.keys(), config_main['auto_white_balance'])
-def set_video_bitrate(bitrate):
-    global player
-    if player is None:
-        return
-    video_source = video_source_option.variable.get()
-    video_encoder = video_encoder_option.variable.get()
-    if RASPBERRY_PI:
-        if video_encoder == 'v4l2h264enc':
-            assert video_source == 'webcam'
-            v4l2h264enc0 = player.get_child_by_name('v4l2h264enc0')
-            v4l2h264enc0.list_properties()
-            extra_controls = v4l2h264enc0.get_property('extra-controls')
-            extra_controls.set_value('video_bitrate', bitrate)
-            v4l2h264enc0.set_property('extra-controls', extra_controls)
-        elif video_encoder == 'x264':
-            x264enc0 = player.get_child_by_name('x264enc0')
-            x264enc0.set_property('bitrate', int(bitrate/1000))
-        else:
-            assert video_source == 'rpicamsrc'
-            set_option('rpicamsrc0', 'bitrate', bitrate)
-    else:
-        assert video_encoder == 'x264'
-        x264enc0 = player.get_child_by_name('x264enc0')
-        x264enc0.set_property('bitrate', int(bitrate/1000))
-video_bitrate_option = PlayerMenuOption(video_frame, 'Video Bitrate:', 'video_bitrate', tkinter.IntVar, set_video_bitrate, [65536,98304,131072,196608,262144,327680,393216,524288,655360,786432,1048576], config_main['video_bitrate'])
-
-# Audio
-audio_frame = create_toggled_frame(controls, 'Audio', False)
-use_echo_cancellation_option = PlayerMenuOption(audio_frame, 'Echo Cancellation:', 'echo_cancellation', tkinter.StringVar, None, ['yes', 'no'], 'yes' if do_autocall else config_main['echo_cancellation'])
-audio_bitrate_option = PlayerMenuOption(audio_frame, 'Audio Bitrate:', 'audio_bitrate', tkinter.IntVar, functools.partial(set_option, 'opusenc0', 'bitrate'), [8192,12288,16384,24576,49152,65536,98304,131072], config_main['audio_bitrate'])
-audio_in_list = [p.name for p in pulse.source_list()]
-audio_in_option = PlayerMenuOption(audio_frame, 'Sound In:', 'audio_in', tkinter.StringVar, None, audio_in_list, config_main['audio_in'] if config_main['audio_in'] in audio_in_list else sorted(audio_in_list)[0])
-audio_out_list = [p.name for p in pulse.sink_list()]
-audio_out_option = PlayerMenuOption(audio_frame, 'Sound Out:', 'audio_out', tkinter.StringVar, None, audio_out_list, config_main['audio_out'] if config_main['audio_out'] in audio_out_list else audio_out_list[0])
-
-# General
-general_frame = create_toggled_frame(controls, 'General', False)
-mode_option = PlayerMenuOption(general_frame, 'Video and Audio:', None, tkinter.StringVar, None, ['video', 'audio', 'both'], 'audio' if do_autocall else 'both')
-# http://gstreamer-devel.966125.n4.nabble.com/SRT-passphrase-and-latency-parameters-td4686833.html
-def set_latency(latency):
-    set_option('srtsrc0', 'latency', latency)
-    set_option('srtsink0', 'latency', latency)
-latency_option = PlayerMenuOption(general_frame, 'Latency:', 'latency', tkinter.IntVar, set_latency, [25,50,75,100,125,150,175,200,250,300,350,400,450,500,600,700,800,900,1000,1200,1400,1600,1800,2000], int(config_main['latency']))
-server_address_entry = PlayerEntry(general_frame, 'Server Address:', 'udp_hole_puncher_server_address', tkinter.StringVar, None)
-server_port_entry = PlayerEntry(general_frame, 'Server Port:', 'udp_hole_puncher_server_port', tkinter.IntVar, None)
-session_id_entry = PlayerEntry(general_frame, 'Session Id:', 'udp_hole_puncher_session_id', tkinter.StringVar, None)
-protocol_option = PlayerMenuOption(general_frame, 'Protocol:', 'protocol', tkinter.StringVar, None, ['udp-proxy','srt-proxy','udp-direct', 'srt-direct'], config_main['protocol'])
-direct_partner_address_entry = PlayerEntry(general_frame, 'Direct Partner Address:', 'direct_partner_address', tkinter.StringVar, None)
-direct_partner_port_entry = PlayerEntry(general_frame, 'Direct Partner Port:', 'direct_partner_port', tkinter.IntVar, None)
-direct_local_port_entry = PlayerEntry(general_frame, 'Direct Local Port:', 'direct_local_port', tkinter.IntVar, None)
-embedded_option = PlayerMenuOption(general_frame, 'Embedded Mode:', 'embedded', tkinter.StringVar, None, ['yes', 'no'], config_main['embedded'])
-loopback_mode_option = PlayerMenuOption(general_frame, 'Loopback Mode:', 'loopback_mode', tkinter.StringVar, None, ['yes', 'no'], config_main['loopback_mode'])
-    
-def close_app():
-    global config, controls, close_client
-    print({section: dict(config[section]) for section in config.sections()})
-    with open(os.path.join(APP_SETTINGS_PATH, INI_FILE_NAME), 'w') as config_file:
-        config.write(config_file)
-    stop_video()
-    controls.destroy()
-    close_client = True
-controls.protocol('WM_DELETE_WINDOW', close_app)    
-    
-def stop_video():
-    global player, video_window, player_process, proxy_process, proxy_stop
-    if embedded_option.variable.get() == 'yes':
-        if player is not None:
-            player.set_state(Gst.State.NULL)
-            player = None
-        if video_window is not None:
-            video_window.destroy()
-            video_window = None
-    else:
-        assert embedded_option.variable.get() == 'no'
-        if player_process is not None:
-            player_process.kill()
-    proxy_stop.value = True
+  @staticmethod
+  def end_call(session_id, connection):
+    shared_memory.set(f'{session_id}.proxy_stop', b'true')
+    proxy_process = OTPProxy.active_proxy_processes[session_id]
     if proxy_process is not None:
-        proxy_process.join()
-    update_otp_positions()
-    store_otp_positions()
-    
-def start_video():
-    global player, video_window, player_process, proxy_process, proxy_ready, proxy_stop, close_client
-    
-    if protocol_option.variable.get() in ('srt-proxy', 'udp-proxy'):
-        proxy_stop.value = False
-        proxy_ready.value = False
-        proxy_process = multiprocessing.Process(
-	    target=OTPProxy.run, 
-            kwargs={
-                'server_address': (config_main['udp_hole_puncher_server_address'], int(config_main['udp_hole_puncher_server_port'])), 
-                'session_id': config_main['udp_hole_puncher_session_id'].encode('utf-8'), 
-                'use_encryption': use_encryption_option.variable.get() == 'yes'
-            }
-        )
-        proxy_process.start()
-        
-        while not proxy_ready.value:
-            controls.update_idletasks()
-            controls.update()
-            if video_window is not None:
-                video_window.update_idletasks()
-                video_window.update()
-            do_shutdown = RASPBERRY_PI_GPIO and (GPIO.input(SHUTDOWN_PIN) == 0)
-            if do_shutdown:
-                close_app()
-            if close_client:
-                return
-            time.sleep(0.05)
-        
-    if embedded_option.variable.get() == 'yes':
-        def on_sync_message(bus, message, video_frame_window_id):
-            if not message.get_structure() is None:
-                if message.get_structure().get_name() == 'prepare-window-handle':
-                    image_sink = message.src
-                    image_sink.set_property("force-aspect-ratio", True)
-                    image_sink.set_window_handle(video_frame_window_id)
-                    print(f'set_window_handle: {video_frame_window_id}')
-                    
-        video_window = tkinter.Toplevel()
-        video_window.protocol('WM_DELETE_WINDOW', stop_video)
-        #window.geometry('800x448')
-        video_window.attributes('-zoomed', True) 
+      # TODO: make this use await asyncio
+      proxy_process.join()
+    OTPProxy.update_otp_in_out_positions([connection])
+    del OTPProxy.active_proxy_processes[session_id]
 
-        def toggle_fullscreen(event=None):
-            video_window.attributes("-fullscreen", not video_window.attributes("-fullscreen"))
-            return "break"
+  @staticmethod
+  def run(session_id):
+    otp_proxy = OTPProxy(session_id)
+    otp_proxy.go()
 
-        def end_fullscreen(event=None):
-            video_window.attributes("-fullscreen", False)
-            return "break"
+  def encrypt(self, message):
+    message_size = len(message)
+    read_size = 2*OTPProxy.NONCE_SIZE + OTPProxy.HASH_SIZE + message_size
+    self.__output_position -= read_size
+    self.__output.seek(self.__output_position)
+    #start_time = time.time()
+    otp_data = self.__output.read(read_size)
+    #duration = time.time() - start_time
+    #rounded_duration = round(duration,2)
+    #self.__encrypt_durations[rounded_duration] += 1
+    #if duration > 0.05:
+    #    print('enc\n' + '\n'.join(f'{k}: {self.__encrypt_durations[k]}' for k in sorted(self.__encrypt_durations.keys())))
+    #if self.__output_position < self.__output_next_truncate_position:
+    #    truncate_to = self.__output_position - self.__output_position % -OTPProxy.TRUNCATE_EVERY_N_BYTES
+    #    print(f"out {self.__output_position} {truncate_to}")
+    #    self.__output.truncate(truncate_to)
+    #    self.__output_next_truncate_position = truncate_to - OTPProxy.TRUNCATE_EVERY_N_BYTES
 
-        video_window.bind("<F11>", toggle_fullscreen)
-        video_window.bind("<Escape>", end_fullscreen)
+    result = []
+    result.append(message_size.to_bytes(4, byteorder="little", signed=False))
+    result.append(self.__output_position.to_bytes(8, byteorder="little", signed=False))
+    part_to_hash = otp_data[0:OTPProxy.NONCE_SIZE] + message
+    part_to_encrypt = hashlib.sha1(part_to_hash).digest() + part_to_hash
+    result.append(numpy.bitwise_xor(
+        numpy.frombuffer(otp_data[OTPProxy.NONCE_SIZE:read_size], dtype=numpy.ubyte),
+        numpy.frombuffer(part_to_encrypt, dtype=numpy.ubyte)
+    ).tobytes())
+    return b''.join(result)
 
-        video_frame = tkinter.Frame(video_window, bg='#000000')
-        video_frame.pack(side=tkinter.BOTTOM,anchor=tkinter.S,expand=tkinter.YES,fill=tkinter.BOTH)
+  def decrypt(self, message):
+    message_size = int.from_bytes(message[0:OTPProxy.LENGTH_SIZE], byteorder='little', signed=False)
+    read_size = 2*OTPProxy.NONCE_SIZE + OTPProxy.HASH_SIZE + message_size
+    packed_size = message_size + OTPProxy.MESSAGE_OVERHEAD_SIZE
+    position = int.from_bytes(message[OTPProxy.LENGTH_SIZE:OTPProxy.HASH_OFFSET], byteorder='little', signed=False)
+    if position + read_size > self.__input_file_size:
+        print('position too high %r' % (position, read_size, self.__input_file_size))
+        return 'position too high', b''
+    if self.__input_min_position is None:
+        self.__input_min_position = position
+    #    self.__input_next_truncate_position = self.__input_min_position - self.__input_min_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
+    elif position < self.__input_min_position:
+        self.__input_min_position = position
+    self.__input.seek(position)
+    #start_time = time.time()
+    otp_data = self.__input.read(read_size)
+    #duration = time.time() - start_time
+    #rounded_duration = round(duration,2)
+    #self.__decrypt_durations[rounded_duration] += 1
+    #if duration > 0.05:
+    #    print('dec\n' + '\n'.join(f'{k}: {self.__decrypt_durations[k]}' for k in sorted(self.__decrypt_durations.keys())))
+    decrypted_part = numpy.bitwise_xor(
+        numpy.frombuffer(otp_data[OTPProxy.NONCE_SIZE:read_size], dtype=numpy.ubyte),
+        numpy.frombuffer(message[OTPProxy.HASH_OFFSET:packed_size], dtype=numpy.ubyte)
+    ).tobytes()
+    if decrypted_part[OTPProxy.HASH_SIZE:OTPProxy.HASH_SIZE+OTPProxy.NONCE_SIZE] != otp_data[0:OTPProxy.NONCE_SIZE]:
+        print('bad nonce %r' % (decrypted_part[OTPProxy.HASH_SIZE:OTPProxy.HASH_SIZE+OTPProxy.NONCE_SIZE], otp_data[0:OTPProxy.NONCE_SIZE]))
+        return 'bad nonce', b''
+    if decrypted_part[0:OTPProxy.HASH_SIZE] != hashlib.sha1(decrypted_part[OTPProxy.HASH_SIZE:]).digest():
+        print('bad hash %r' % (decrypted_part[0:OTPProxy.HASH_SIZE], hashlib.sha1(decrypted_part[OTPProxy.HASH_SIZE:]).digest()))
+        return 'bad hash', b''
+    # only truncate after validation is complete
+    #if self.__input_min_position < self.__input_next_truncate_position and self.__input_next_truncate_position < self.__input_file_size:
+    #    if self.__input_next_truncate_position + OTPProxy.IN_TRUNCATE_GRACE_WINDOW < self.__input_file_size:
+    #        self.__input_file_size = self.__input_next_truncate_position + OTPProxy.IN_TRUNCATE_GRACE_WINDOW
+    #        print(f"in {self.__input_file_size}")
+    #        self.__input.truncate(self.__input_file_size)
+    #    self.__input_next_truncate_position = self.__input_min_position - self.__input_min_position % OTPProxy.TRUNCATE_EVERY_N_BYTES
+    return None, decrypted_part[OTPProxy.NONCE_SIZE+OTPProxy.HASH_SIZE:]
 
-        video_frame_window_id = video_frame.winfo_id()
-        print(f'video_frame_window_id: {video_frame_window_id}')
-        
-        video_window.update_idletasks()
-        video_window.update()
+  def cleanup(self):
+    pass
+    #print('enc\n' + '\n'.join(f'{k}: {self.__encrypt_durations[k]}' for k in sorted(self.__encrypt_durations.keys())))
+    #print('dec\n' + '\n'.join(f'{k}: {self.__decrypt_durations[k]}' for k in sorted(self.__decrypt_durations.keys())))
+    #print(f"out {self.__output_position}")
+    #self.__output.truncate(self.__output_position)
+    #if self.__input_min_position is not None:
+    #    print(f"in {self.__input_min_position}")
+    #    self.__input.truncate(self.__input_min_position)
 
-    resolution_x, resolution_y = video_resolution_option.variable.get().split('x')
-    framerate = '%d/1' % webcam_capabilities[video_source_option.variable.get()][video_resolution_option.variable.get()][0]
+  def go(self):
+    sock_local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock_local.bind(self.__local_listen_address)
+    print("local_listen_address: " + repr(self.__local_listen_address))
+    sock_local.settimeout(None)
+    while True:
+      sock_local.sendto(self.__session_id.encode('utf-8'), self.__server_address)
+      sock_local.settimeout(2)
+      try:
+        remote_data, _ = sock_local.recvfrom(4096)
+        break
+      except socket.timeout:
+        time.sleep(1)
+      with shared_memory_lock:
+        if shared_memory.get(f'{self.__session_id}.proxy_stop') == b'true':
+          return
+    remote_ip, remote_port = remote_data.decode('utf-8').strip().split(':')
+    remote_address = (remote_ip, int(remote_port))
+    print("remote_address: " + repr(remote_address))
 
-    launch_command_parts = []
-    mode = mode_option.variable.get()
-    audio_in = audio_in_option.variable.get()
-    audio_out = audio_out_option.variable.get()
-    video_source = video_source_option.variable.get()
-    video_encoder = video_encoder_option.variable.get()
-    
-    
-    if protocol_option.variable.get() == 'srt-proxy':
-        launch_command_parts.append(
-            #f'srtsrc uri=srt://127.0.0.1:9999/ localaddress=127.0.0.1 localport=9998 mode=listener latency={latency_option.variable.get()} name=srtsrc0 '
-            f'srtsrc uri=srt://127.0.0.1:9999/ localaddress=127.0.0.1 localport=9998 mode=caller latency={latency_option.variable.get()} name=srtsrc0 '
-        )
-    elif protocol_option.variable.get() == 'udp-proxy':
-        launch_command_parts.append(
-            f'udpsrc port=9998 name=udpsrc0 '
-        )
-    else:
-        assert protocol_option.variable.get() in ('srt-direct', 'udp-direct')
-        if loopback_mode_option.variable.get() == 'yes':
-            partner_address = '127.0.0.1'
-            partner_port = direct_local_port_entry.variable.get()
+    with shared_memory_lock:
+      shared_memory.set(f'{self.__session_id}.proxy_ready', b'true')
+    sock_local.settimeout(1)
+    print("ready")
+    try:
+      proxy_stop = False
+      while not proxy_stop:
+        try:
+          data, address = sock_local.recvfrom(4096)
+          #print("data in")
+        except socket.timeout:
+          with shared_memory_lock:
+            proxy_stop = shared_memory.get(f'{self.__session_id}.proxy_stop') == b'true'
+          continue
+        if not data:
+          print("*")
+          break
+        error = None
+        if address[0] == self.__local_relay_address[0]:
+          target_address = remote_address
+          if self.__encryption:
+            data = self.encrypt(data)
+          #print(f'outbound sending {data} from {address} to {target_address}')
+          sock_local.sendto(data, target_address)
+        elif address[0] == remote_address[0]:
+          target_address = self.__local_relay_address
+          if self.__encryption:
+            error, data = self.decrypt(data)
+            if error is not None:
+              print(f'error decrypting "{error}" dropping packet')
+          if error is None:
+            #print(f'inbound sending {data} from {address} to {target_address}')
+            sock_local.sendto(data, target_address)
         else:
-            partner_address = direct_partner_address_entry.variable.get()
-            partner_port = direct_partner_port_entry.variable.get()
-        if protocol_option.variable.get() == 'srt-direct':
-            launch_command_parts.append(
-                #f'srtsrc uri=srt://{partner_address}:{partner_port}/ localaddress=0.0.0.0 localport={direct_local_port_entry.variable.get()} mode=listener latency={latency_option.variable.get()} name=srtsrc0 '
-                f'srtsrc uri=srt://{partner_address}:{partner_port}/ mode=caller latency={latency_option.variable.get()} name=srtsrc0 '
-            )
-        elif protocol_option.variable.get() == 'udp-direct':
-            launch_command_parts.append(
-                f'udpsrc port={direct_local_port_entry.variable.get()} name=udpsrc0 '
-            )
-    launch_command_parts.append(f'! queue ! tsparse ')
-    if RASPBERRY_PI:
-        launch_command_parts.append(f'! tsdemux name=in ') # on raspberry pi the default latency is overriden in the code
-    else:
-        launch_command_parts.append(f'! tsdemux latency=50 name=in ')
+          print(f'Unexpected address {address} no known target.')
+        if self.__encryption and time.time() > self.__update_global_otp_positions_at_time:
+          with shared_memory_lock:
+            otp_in_positions = shared_memory.getobj(f'{self.__session_id}.otp_in_positions')
+            otp_out_positions = shared_memory.getobj(f'{self.__session_id}.otp_out_positions')
+            otp_in_positions[self.__otp_in_file] = self.__input_min_position if self.__input_min_position is not None else 999999999999999
+            otp_out_positions[self.__otp_out_file] = self.__output_position
+            shared_memory.setobj(f'{self.__session_id}.otp_in_positions', otp_in_positions)
+            shared_memory.setobj(f'{self.__session_id}.otp_out_positions', otp_out_positions)
+          self.__update_global_otp_positions_at_time = time.time() + 5
+        with shared_memory_lock:
+          proxy_stop = shared_memory.get(f'{self.__session_id}.proxy_stop') == b'true'
+    finally:
+      self.cleanup()
+      if self.__encryption:
+        with shared_memory_lock:
+          otp_in_positions = shared_memory.getobj(f'{self.__session_id}.otp_in_positions')
+          otp_out_positions = shared_memory.getobj(f'{self.__session_id}.otp_out_positions')
+          otp_in_positions[self.__otp_in_file] = self.__input_min_position if self.__input_min_position is not None else 999999999999999
+          otp_out_positions[self.__otp_out_file] = self.__output_position
+          shared_memory.setobj(f'{self.__session_id}.otp_in_positions', otp_in_positions)
+          shared_memory.setobj(f'{self.__session_id}.otp_out_positions', otp_out_positions)
 
-    
-    if mode in ('video', 'both'):
-        launch_command_parts.append(f'in. ! h264parse ! queue ') 
-        if RASPBERRY_PI:
-            #launch_command_parts.append(f'! v4l2h264dec capture-io-mode=4 ') # can't seem to decode pc video maybe if we put a video convert before it it could handle the stream
-            launch_command_parts.append(f'! decodebin capture-io-mode=4 ')
-            #launch_command_parts.append(f'! avdec_h264 ')
-        else:
-            launch_command_parts.append(f'! avdec_h264 ')
-        launch_command_parts.append(f'! queue ') 
-        if embedded_option.variable.get() == 'yes':
-            if RASPBERRY_PI:
-                launch_command_parts.append(f'! xvimagesink async=false ')
-            else:
-                launch_command_parts.append(f'! glimagesink async=false ')
-        else:
-            assert embedded_option.variable.get() == 'no'
-            if RASPBERRY_PI:
-                launch_command_parts.append(f'! xvimagesink async=false ')
-            else:
-                launch_command_parts.append(f'! glimagesink async=false ')
-    if mode in ('audio', 'both'):
-        launch_command_parts.append(f'in. ! queue ! opusdec ')
-        if use_echo_cancellation_option.variable.get() == 'yes':
-            launch_command_parts.append(f'! webrtcechoprobe name=webrtcechoprobe0 ')
-        # pactl list
-        launch_command_parts.append(f'! queue ! pulsesink device={audio_out} async=false')
-    launch_command_parts.append(f' ')
-    
-    if mode in ('video', 'both'):
-        if RASPBERRY_PI:        
-            if video_source == 'webcam':
-                if video_encoder == 'v4l2h264enc':
-                    launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 io-mode=5 ! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! v4l2h264enc output-io-mode=4 extra-controls="controls,video_bitrate={video_bitrate_option.variable.get()};" ')
-                else:
-                    assert video_encoder == 'x264'
-                    launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 ! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate_option.variable.get()/1000)} speed-preset=superfast ')
-            else:
-                assert video_source == 'rpicamsrc'
-                assert video_encoder == 'rpicamsrc'
-                launch_command_parts.append(f'rpicamsrc rotation=90 bitrate={video_bitrate_option.variable.get()} awb-mode={awb_modes[video_awb_option.variable.get()]} preview=1 preview-encoded=1 fullscreen=0 preview-x=20 preview-y=20 preview-w=320 preview-h=190 do-timestamp=1 name=rpicamsrc0 ! video/x-h264,width={resolution_x},height={resolution_y},framerate=30/1 ')
-        else:
-            launch_command_parts.append(f'v4l2src device={video_in_option.variable.get()} do-timestamp=1 ')
-            if video_source == 'webcam':
-                #launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! videoconvert ')
-                launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! videoconvert ! video/x-raw,format=I420 ')
-            else:
-                assert video_source == 'webcam-jpeg'
-                #launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} ! jpegdec ')
-                launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} ! jpegdec ! videoconvert ! video/x-raw,format=I420 ')
-            assert video_encoder == 'x264'
-            launch_command_parts.append(f'! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate_option.variable.get()/1000)} speed-preset=superfast ')
-        launch_command_parts.append(f'! queue ! h264parse config-interval=1 ! out. ')
+# player
 
-    if mode in ('audio', 'both'):
-        launch_command_parts.append(f'pulsesrc device={audio_in} do-timestamp=1 ')
-        launch_command_parts.append(f'! queue ! audioconvert ! audio/x-raw,format=S16LE,rate=48000,channels=2 ')
-        if use_echo_cancellation_option.variable.get() == 'yes':
-            launch_command_parts.append(f'! webrtcdsp ')
-        launch_command_parts.append(f'! opusenc bitrate={audio_bitrate_option.variable.get()} name=opusenc0 ! queue ! out. ')
-        
-    launch_command_parts.append(f'mpegtsmux alignment=7 name=out ')    
-    if protocol_option.variable.get() == 'srt-proxy':
-        launch_command_parts.append(
-            #f'! srtsink uri=srt://127.0.0.1:9999/ localaddress=127.0.0.1 localport=9998 mode=caller latency={latency_option.variable.get()} name=srtsink0 '
-            f'! srtsink uri=srt://127.0.0.1:9999/ localaddress=127.0.0.1 localport=9998 mode=listener latency={latency_option.variable.get()} name=srtsink0 '
-        )
-    elif protocol_option.variable.get() == 'udp-proxy':
-        launch_command_parts.append(
-            f'! udpsink host=127.0.0.1 port=9999 name=udpsink0 '
-        )
-    else:
-        assert protocol_option.variable.get() in ('srt-direct', 'udp-direct')
-        if loopback_mode_option.variable.get() == 'yes':
-            partner_address = '127.0.0.1'
-            partner_port = direct_local_port_entry.variable.get()
-        else:
-            partner_address = direct_partner_address_entry.variable.get()
-            partner_port = direct_partner_port_entry.variable.get()
-        if protocol_option.variable.get() == 'srt-direct':
-            launch_command_parts.append(
-                #f'! srtsink uri=srt://{partner_address}:{partner_port}/ mode=caller latency={latency_option.variable.get()} sync=false async=false name=srtsink0 '
-                f'! srtsink uri=srt://{partner_address}:{partner_port}/ localaddress=0.0.0.0 localport={direct_local_port_entry.variable.get()} mode=listener latency={latency_option.variable.get()} sync=false async=false name=srtsink0 '
-            )
-        elif protocol_option.variable.get() == 'udp-direct':
-            launch_command_parts.append(
-                f'! udpsink host={partner_address} port={partner_port} name=udpsink0 '
-            )
+player = None
 
-    launch_command = ''.join(launch_command_parts)
-    print(launch_command)
-    if embedded_option.variable.get() == 'yes':
-        player = Gst.parse_launch(launch_command)
+class Player(object):
 
-        bus = player.get_bus()
+  def __init__(self, store):
+    self.__video_window = None
+    self.__video_frame = None
+    self.__video_frame_window_id = None
+    self.__player_process = None
+    self.__active_connections = set()
+    self.store = store
+
+  def player_active(self):
+    return self.__video_window is not None or self.__player_process is not None
+
+  def player_is_active_and_embedded(self):
+    return self.__video_window is not None
+
+  def create_player_task(self, loop: BaseEventLoop)->Task:
+    async def player_updater(interval):
+      while True:
+        if self.__video_window is not None:
+          self.__video_window.update_idletasks()
+          self.__video_window.update()
+          #print("updated video_window")
+        await asyncio.sleep(interval)
+    return loop.create_task(player_updater(1/120))
+
+  def has_active_connection(self, connection):
+    session_id = connection['shared_session_id']
+    return session_id in self.__active_connections
+
+  def start_connections(self, connections):
+    assert not self.player_active() or self.player_is_active_and_embedded(), 'Only embedded player supports addition of users during call.'
+    self.__active_connections.update({c['shared_session_id'] for c in connections})
+    connection_defaults = self.store.state['settings']['connection_defaults']  # @UnusedVariable
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    av_setting = list(x for x in self.store.state['settings']['av_settings'] if x['name'] == self.store.state['settings']['av_setting_selected'])[0]
+    embedded = av_setting_defaults['embedded']
+    if 'embedded' in av_setting:
+      embedded = av_setting['embedded']
+    if embedded == 'yes':
+      def on_sync_message(bus, message, video_frame_window_id):
+        if not message.get_structure() is None:
+          if message.get_structure().get_name() == 'prepare-window-handle':
+            print('video_frame_window_id: ')
+            print(video_frame_window_id)
+            image_sink = message.src
+            image_sink.set_property("force-aspect-ratio", True)
+            image_sink.set_window_handle(video_frame_window_id)
+            print(f'set_window_handle: {video_frame_window_id}')
+
+      self.__video_window = tk.Toplevel()
+      self.__video_window.protocol('WM_DELETE_WINDOW', functools.partial(self.stop_connections, None))
+      self.__video_window.geometry('1280x720')
+      #self.__video_window.attributes('-zoomed', True)
+
+      def toggle_fullscreen(event=None):
+        self.__video_window.attributes("-fullscreen", not self.__video_window.attributes("-fullscreen"))
+        return "break"
+
+      def end_fullscreen(event=None):
+        self.__video_window.attributes("-fullscreen", False)
+        return "break"
+
+      self.__video_window.bind("<F11>", toggle_fullscreen)
+      self.__video_window.bind("<Escape>", end_fullscreen)
+
+      self.__video_frame = tk.Frame(self.__video_window, bg='#000000')
+      self.__video_frame.pack(side=tk.BOTTOM,anchor=tk.S,expand=tk.YES,fill=tk.BOTH)
+
+      self.__video_frame_window_id = self.__video_frame.winfo_id()
+      print(f'video_frame_window_id: {self.__video_frame_window_id}')
+
+      self.__video_window.update_idletasks()
+      self.__video_window.update()
+
+    gstreamer_launch_command = self.build_complete_gstreamer_launch_command(connections, av_setting)
+    print(gstreamer_launch_command)
+    if embedded == 'yes':
+        self.__player = Gst.parse_launch(gstreamer_launch_command)
+        bus = self.__player.get_bus()
         bus.add_signal_watch()
         bus.enable_sync_message_emission()
-        bus.connect('sync-message::element', on_sync_message, video_frame_window_id)
-
-        player.set_state(Gst.State.PLAYING)
+        bus.connect('sync-message::element', on_sync_message, self.__video_frame_window_id)
+        self.__player.set_state(Gst.State.PLAYING)
     else:
-        assert embedded_option.variable.get() == 'no'
+        assert embedded == 'no'
         arguments = ['gst-launch-1.0']
-        arguments.extend(launch_command.split(' '))
-        
-        player_process = subprocess.Popen(arguments)
+        arguments.extend(gstreamer_launch_command.split(' '))
+        self.__player_process = subprocess.Popen(arguments)
 
-control_frame = create_toggled_frame(controls, 'Control', True)
-start_button = tkinter.Button(control_frame, text='Start', command=start_video)
-start_button.pack(side=tkinter.LEFT,expand=tkinter.YES,fill=tkinter.BOTH)
-stop_button = tkinter.Button(control_frame, text='Stop', command=stop_video)
-stop_button.pack(side=tkinter.LEFT,expand=tkinter.YES,fill=tkinter.BOTH)
-controls.update_idletasks()
-controls.update()
+  def stop_connections(self, connections):
+    # connection: None indicates window closed
+    if connections is None:
+      self.__active_connections = set()
+    else:
+      for connection in connections:
+        self.__active_connections.remove(connection['shared_session_id'])
+        # TODO: remove gstreamer elements related to connection being stopped
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    av_setting = list(x for x in self.store.state['settings']['av_settings'] if x['name'] == self.store.state['settings']['av_setting_selected'])[0]
+    embedded = av_setting_defaults['embedded']
+    if 'embedded' in av_setting:
+      embedded = av_setting['embedded']
+    if not self.__active_connections or embedded == 'no':
+      if embedded == 'yes':
+        if self.__player is not None:
+          self.__player.set_state(Gst.State.NULL)
+          self.__player = None
+        self.__video_frame = None
+        self.__video_frame_window_id = None
+        if self.__video_window is not None:
+          self.__video_window.destroy()
+          self.__video_window = None
+      else:
+        assert embedded == 'no'
+        if self.__player_process is not None:
+          self.__player_process.kill()
+          self.__player_process = None
 
-if do_autocall:
-    start_video()
+  def build_complete_gstreamer_launch_command(self, connections, av_setting):
+    active_connections = self.store.state['active_connections']
+    connection_defaults = self.store.state['settings']['connection_defaults']
+
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    av_setting_data = copy.deepcopy(av_setting_defaults)
+    for k, v in av_setting['overrides'].items():
+      av_setting_data[k] = copy.deepcopy(v)
+    mode = av_setting_data['mode']
+    video_in = av_setting_data['video_in']
+    video_source, resolution, fps = av_setting_data['video_source'].split(' ')
+    resolution_x, resolution_y = resolution.split('x')
+    resolution_x = int(resolution_x)
+    resolution_y = int(resolution_y)
+    framerate = '%d/1' % int(float(fps))
+    video_bitrate = av_setting_data['video_bitrate']
+    video_encoder = av_setting_data['video_encoder']
+    auto_white_balance = av_setting_data['auto_white_balance']
+    audio_in = av_setting_data['audio_in']
+    audio_out = av_setting_data['audio_out']
+    audio_bitrate = av_setting_data['audio_bitrate']
+    echo_cancellation = av_setting_data['echo_cancellation']
+    embedded = av_setting_data['embedded']
+
+    launch_command_parts = []
+    for idx, connection in enumerate(connections):
+      connection_data = copy.deepcopy(connection_defaults)
+      for k, v in connection['overrides'].items():
+        connection_data[k] = copy.deepcopy(v)
+      direct_local_port = connection_data['direct_local_port']
+      direct_partner_address = connection_data['direct_partner_address']
+      direct_partner_port = connection_data['direct_partner_port']
+      loopback_mode = connection_data['loopback_mode']
+      protocol = connection_data['protocol']
+      session_id = connection['shared_session_id']
+      active_connection = active_connections[session_id]
+      local_relay_address = active_connection['local_relay_address']
+      local_listen_address = active_connection['local_listen_address']
+      if protocol == 'srt-proxy':
+        launch_command_parts.append(
+          #f'srtsrc uri=srt://127.0.0.1:{local_listen_address[1]}/ localaddress=127.0.0.1 localport={local_relay_address[1]} mode=listener name=srtsrc_{session_id} '
+          f'srtsrc uri=srt://127.0.0.1:{local_listen_address[1]}/ localaddress=127.0.0.1 localport={local_relay_address[1]} mode=caller name=srtsrc_{session_id} '
+        )
+      elif protocol == 'udp-proxy':
+        launch_command_parts.append(
+          f'udpsrc port={local_relay_address[1]} name=udpsrc_{session_id} '
+        )
+      else:
+        assert protocol in ('srt-direct', 'udp-direct')
+        if loopback_mode == 'yes':
+          partner_address = '127.0.0.1'
+          partner_port = direct_local_port
+        else:
+          partner_address = direct_partner_address
+          partner_port = direct_partner_port
+        if protocol == 'srt-direct':
+          launch_command_parts.append(
+            #f'srtsrc uri=srt://{partner_address}:{partner_port}/ localaddress=0.0.0.0 localport={direct_local_port} mode=listener name=srtsrc_{session_id} '
+            f'srtsrc uri=srt://{partner_address}:{partner_port}/ mode=caller name=srtsrc_{session_id} '
+          )
+        elif protocol == 'udp-direct':
+          launch_command_parts.append(
+            f'udpsrc port={direct_local_port} name=udpsrc_{session_id} '
+          )
+      launch_command_parts.append(f'! queue ! tsparse ')
+      if RASPBERRY_PI:
+        launch_command_parts.append(f'! tsdemux name=in_{session_id} ') # on raspberry pi the default latency is overriden in the code
+      else:
+        launch_command_parts.append(f'! tsdemux latency=50 name=in_{session_id} ')
+      if mode in ('video', 'audio_and_video'):
+        launch_command_parts.append(f'in_{session_id}. ! h264parse ! queue ')
+        if RASPBERRY_PI:
+          #launch_command_parts.append(f'! v4l2h264dec capture-io-mode=4 ') # can't seem to decode pc video maybe if we put a video convert before it it could handle the stream
+          launch_command_parts.append(f'! decodebin capture-io-mode=4 ')
+          #launch_command_parts.append(f'! avdec_h264 ')
+        else:
+          launch_command_parts.append(f'! avdec_h264 ')
+        launch_command_parts.append(f'! queue ')
+        launch_command_parts.append(f'! video_mix.sink_{idx} ')
+      if mode in ('audio', 'audio_and_video'):
+        launch_command_parts.append(f'in_{session_id}. ! queue ! opusdec ')
+        launch_command_parts.append(f'! queue ')
+        launch_command_parts.append(f'! audio_mix. ')
+
+    if mode in ('video', 'audio_and_video'):
+      launch_command_parts.append(f'glvideomixer name=video_mix background=1 ')
+      screen_resolution_x, _ = app.resolution()
+      x_tile_count = int(int(screen_resolution_x) / resolution_x)
+      for idx in range(len(connections)):
+        launch_command_parts.append(f'sink_{idx}::xpos={(idx%x_tile_count)*resolution_x} sink_{idx}::ypos={int(idx/x_tile_count)*resolution_y} ')
+      if embedded == 'yes':
+        if RASPBERRY_PI:
+          launch_command_parts.append(f'! xvimagesink async=false name=xvimagesink ')
+        else:
+          launch_command_parts.append(f'! glimagesink async=false name=glimagesink ')
+      else:
+        assert embedded == 'no'
+        if RASPBERRY_PI:
+          launch_command_parts.append(f'! xvimagesink async=false name=xvimagesink ')
+        else:
+          launch_command_parts.append(f'! glimagesink async=false name=glimagesink ')
+    if mode in ('audio', 'audio_and_video'):
+      launch_command_parts.append(f'audiomixer name=audio_mix ')
+      if echo_cancellation == 'yes':
+        launch_command_parts.append(f'! webrtcechoprobe name=webrtcechoprobe0 ') # not sure if this will work well after the adder as each connection may have different latency we may need one for each stream...
+      launch_command_parts.append(f'! pulsesink device={audio_out} async=false ')
+
+    if mode in ('video', 'audio_and_video'):
+      if RASPBERRY_PI:
+        if video_source == 'webcam':
+          if video_encoder == 'v4l2h264enc':
+            launch_command_parts.append(f'v4l2src device={video_in} do-timestamp=1 io-mode=5 ! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! v4l2h264enc output-io-mode=4 extra-controls="controls,video_bitrate={video_bitrate};" ')
+          else:
+            assert video_encoder == 'x264'
+            launch_command_parts.append(f'v4l2src device={video_in} do-timestamp=1 ! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate/1000)} speed-preset=superfast ')
+        else:
+          assert video_source == 'rpicamsrc'
+          assert video_encoder == 'rpicamsrc'
+          launch_command_parts.append(f'rpicamsrc rotation=90 bitrate={video_bitrate} awb-mode={awb_modes[auto_white_balance]} preview=1 preview-encoded=1 fullscreen=0 preview-x=20 preview-y=20 preview-w=320 preview-h=190 do-timestamp=1 name=rpicamsrc0 ! video/x-h264,width={resolution_x},height={resolution_y},framerate={framerate} ')
+      else:
+        launch_command_parts.append(f'v4l2src device={video_in} do-timestamp=1 ')
+        if video_source == 'webcam':
+          #launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! videoconvert ')
+          launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! videoconvert ! video/x-raw,format=I420 ')
+        else:
+          assert video_source == 'webcam-jpeg'
+          #launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} ! jpegdec ')
+          launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} ! jpegdec ! videoconvert ! video/x-raw,format=I420 ')
+        assert video_encoder == 'x264'
+        launch_command_parts.append(f'! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate/1000)} speed-preset=superfast ')
+      launch_command_parts.append(f'! queue ! h264parse config-interval=1 ! out. ')
+
+    if mode in ('audio', 'audio_and_video'):
+      launch_command_parts.append(f'pulsesrc device={audio_in} do-timestamp=1 ')
+      launch_command_parts.append(f'! queue ! audioconvert ! audio/x-raw,format=S16LE,rate=48000,channels=2 ')
+      if echo_cancellation == 'yes':
+        launch_command_parts.append(f'! webrtcdsp ')
+      launch_command_parts.append(f'! opusenc bitrate={audio_bitrate} name=opusenc0 ! queue ! out. ')
+    launch_command_parts.append(f'mpegtsmux alignment=7 name=out ')
+    launch_command_parts.append(f'! tee name=mpegtsmux_tee ')
+
+    for connection in connections:
+      connection_data = copy.deepcopy(connection_defaults)
+      for k, v in connection['overrides'].items():
+        connection_data[k] = copy.deepcopy(v)
+      direct_local_port = connection_data['direct_local_port']
+      direct_partner_address = connection_data['direct_partner_address']
+      direct_partner_port = connection_data['direct_partner_port']
+      loopback_mode = connection_data['loopback_mode']
+      protocol = connection_data['protocol']
+      session_id = connection['shared_session_id']
+      active_connection = active_connections[session_id]
+      local_relay_address = active_connection['local_relay_address']
+      local_listen_address = active_connection['local_listen_address']
+      launch_command_parts.append(f'mpegtsmux_tee. ! queue ')
+      if protocol == 'srt-proxy':
+        launch_command_parts.append(
+          #f'! srtsink uri=srt://127.0.0.1:{local_listen_address[1]}/ localaddress=127.0.0.1 localport={local_relay_address[1]} mode=caller name=srtsink_{session_id} '
+          f'! srtsink uri=srt://127.0.0.1:{local_listen_address[1]}/ localaddress=127.0.0.1 localport={local_relay_address[1]} mode=listener name=srtsink_{session_id} '
+        )
+      elif protocol == 'udp-proxy':
+        launch_command_parts.append(
+          f'! udpsink host=127.0.0.1 port={local_listen_address[1]} name=udpsink_{session_id} '
+        )
+      else:
+        assert protocol in ('srt-direct', 'udp-direct')
+        if loopback_mode == 'yes':
+          partner_address = '127.0.0.1'
+          partner_port = direct_local_port
+        else:
+          partner_address = direct_partner_address
+          partner_port = direct_partner_port
+        if protocol == 'srt-direct':
+          launch_command_parts.append(
+            #f'! srtsink uri=srt://{partner_address}:{partner_port}/ mode=caller sync=false async=false name=srtsink_{session_id} '
+            f'! srtsink uri=srt://{partner_address}:{partner_port}/ localaddress=0.0.0.0 localport={direct_local_port} mode=listener sync=false async=false name=srtsink_{session_id} '
+          )
+        elif protocol == 'udp-direct':
+          launch_command_parts.append(
+            f'! udpsink host={partner_address} port={partner_port} name=udpsink_{session_id} '
+          )
+
+    launch_command = ''.join(launch_command_parts)
+    return launch_command
+
+# TODO: flush out this logic
+
+# from layoutx/app.py
+
+import tkinter           as tk  # @NoMove
+import tkinter.font      as tkFont  # @NoMove
+from layoutx.store              import Store  # @NoMove
+from layoutx.view               import View, ResizeOption  # @NoMove @Reimport
+from layoutx.utils              import Singleton, is_windows  # @NoMove
+from layoutx._registry           import RegistryNode  # @NoMove
+from layoutx.tkDnD              import TkinterDnD  # @NoMove
+import logging  # @NoMove @Reimport @UnusedImport
+import asyncio  # @NoMove @Reimport
+
+@Singleton
+class Application(RegistryNode):
+  def __init__(self):
+    super().__init__(widget = self, name = "app")
+
+    #Import Widgets
+    import layoutx.widgets
+    self._widgets = {}
+    for name in layoutx.widgets.__all__:
+      self._widgets.update({name : getattr(layoutx.widgets, name)})
+
+    self._tk = None
+    self._use_local_loop = True
+    self._loop = None
+    self._root_node = None
+    self._style = None
+    self._config = {}
+
+  def resolution(self):
+    if self._tk:
+      return (self._tk.winfo_screenwidth(), self._tk.winfo_screenheight())
+    else:
+      return (None, None)
+
+  def setup(self, store: Store, rootView: View, font=None, style: str=None, interval=1/120, loop=None, player_task: Task=None, proxy_task: Task=None):
+    print('my special setup')
+    if not self._tk:
+      self._tk = TkinterDnD.Tk()
+      if loop:
+        self._use_local_loop = False
+        self._loop = loop
+      else:
+        self._use_local_loop = True
+        self._loop = asyncio.get_event_loop()
+      self._tk.protocol("WM_DELETE_WINDOW", self.close)
+      self._ui_task = self._loop.create_task(self._updater(interval))
+    self._player_task = player_task
+    self._proxy_task = proxy_task
+
+    # Pick first system font as default if none given
+    if font:
+      self._config["font"] = font
+    else:
+      if is_windows():
+        self._config["font"] = {"family": "Courier New", "size": 12} if "Courier New" in tkFont.families() else {"family":tkFont.families()[1], "size": 12}
+      else:
+        self._config["font"] = {"family": "DejaVu Sans Mono", "size": 12} if "DejaVu Sans Mono" in tkFont.families() else {"family":tkFont.families()[1], "size": 12}
+
+    if style and not self._style:
+      try:
+        from ttkthemes import ThemedStyle
+        self._style   = ThemedStyle(self._tk)
+        self._style.set_theme(style)
+      except ImportError:
+        # ttkstyles not installed
+        self._style   = tk.ttk.Style()
+    else:
+      self._style   = tk.ttk.Style()
+
+    if self._root_node:
+      self.remove_node(self._root_node)
+
+    self._root_node = self.add_view(
+      rootView(
+        tkinter=self._tk,
+        store=store
+      )
+    )
+    self._root_node.widget.redraw()
+
+  @property
+  def loop(self):
+    return self._loop
+
+  def close(self):
+    self._ui_task.add_done_callback(lambda *_: self._cleanup())
+    self._player_task.add_done_callback(lambda *_: self._cleanup())
+    self._proxy_task.add_done_callback(lambda *_: self._cleanup())
+    self._ui_task.cancel()
+    self._player_task.cancel()
+    self._proxy_task.cancel()
+
+  @property
+  def config(self):
+    return self._config
+
+  @property
+  def style(self):
+    return self._style
+
+  def run( self ):
+    self._loop.run_forever()
+    self._loop.close()
+
+  def get_root_node(self) -> RegistryNode:
+    return self._root_node
+
+  def get_view(self, name: str) -> RegistryNode:
+    filter_view = self.filter_children(name=name)
+    if len(filter_view) == 1:
+      return filter_view[0]
+    else:
+      raise ValueError(f"View {name} not registed")
+
+  def add_view(self, view: View) -> RegistryNode:
+    name = view.__class__.__name__
+    old_view = self.filter_children(name=name)
+    if len(old_view) > 0:
+      self.remove_node(old_view[0])
+    if len(self.children) > 0:
+      view.hide()
+    return self._add_node(widget=view, name=view.__class__.__name__)
+
+  def add_custom_widget(self, name, cls):
+    if name in self._widgets:
+      raise ValueError(f"Widget name: {name} already exists")
+
+    self._widgets[name] = cls
+
+  def update(self):
+    self._tk.update()
+
+  def get_widget_cls(self, name):
+    if name not in self._widgets:
+      raise KeyError(f"Widget: {name}, does not exist or was never added to the registry")
+    return self._widgets[name]
+
+  async def _updater(self, interval):
+    while True:
+      self.update()
+      await asyncio.sleep(interval)
+
+  def _cleanup(self):
+    if (
+      not self._ui_task.done() or
+      (self._player_task is not None and not self._player_task.done()) or
+      (self._proxy_task is not None and not self._proxy_task.done())
+    ):
+      return
+    self._loop.stop()
+    self._tk.destroy()
+
+layoutx.app.Application = Application
+layoutx.app = Application.instance()
+from layoutx import app  # @NoMove
+
+# from layoutx/widgets/combobox.py
+
+from tkinter import ttk, StringVar  # @NoMove
+
+class MyComboBox(Widget):
+  def __init__(self, master, **kwargs):
+    self._textv = StringVar()
+    super().__init__(
+      tk=ttk.Combobox(
+        master=master,
+        textvariable=self._textv
+      ),**kwargs
+    )
+    self._setter = self.connect_to_prop("value", self.on_changed_value)
+    self._trace = self._textv.trace_add("write",
+      lambda *_: self._setter(self._textv.get())
+    )
+    self.connect_to_prop("suggestion", self.on_changed_suggestion)
+
+  def on_changed_suggestion(self, value):
+    self._tk.configure(values=value if value else [])
+
+  def on_changed_value(self, value):
+    self._textv.set(value)
+
+  def on_disposed(self):
+    self._textv.trace_remove("write", self._trace)
+    self._setter = None
+
+def build_editor_data(defaults, overrides):
+  editor_data = {'overrides': {k: 0 for k in defaults}, 'values': defaults.copy()}
+  for k in overrides:
+    editor_data['overrides'][k] = 1
+    editor_data['values'][k] = overrides[k]
+  return editor_data
+
+def extract_overrides(editor_data):
+  overrides = {}
+  for k in editor_data['overrides']:
+    if editor_data['overrides'][k]:
+      overrides[k] = editor_data['values'][k]
+  return overrides
+
+def repair_editor_data_honor_checkbox(defaults, editor_data):
+  new_editor_data = editor_data.copy()
+  repaired = False
+  for k, v in editor_data['overrides'].items():
+    if v == 0 and editor_data['values'][k] != defaults[k]:
+      new_editor_data['values'][k] = defaults[k]
+      repaired = True
+  return new_editor_data, repaired
+
+def repair_editor_data_honor_values(defaults, editor_data):
+  new_editor_data = editor_data.copy()
+  repaired = False
+  for k, v in editor_data['overrides'].items():
+    if ((v == 0 and editor_data['values'][k] != defaults[k]) or
+        (v == 1 and editor_data['values'][k] == defaults[k])):
+      new_editor_data['overrides'][k] = editor_data['values'][k] != defaults[k]
+      repaired = True
+  return new_editor_data, repaired
+
+class EditAVSetting(View):
+  geometry  = '500x400+200+200'
+  title     = 'Edit AV Setting'
+  resizable = ResizeOption.BOTH
+  template = '''\
+Box
+  Box(weight='0' orient='horizontal')
+    Label {'AV Setting Name: '}
+    Input(value='{{editing_av_setting.scratch_av_setting.name}}')
+    Label {'Override?'}
+  Box(weight='0' orient='horizontal')
+    Label {'Video In: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.video_in}}' suggestion='{editing_av_setting.available_av_setting.video_in}' enabled='{editing_av_setting.scratch_av_setting.overrides.video_in}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.video_in}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Video Source: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.video_source}}' suggestion='{editing_av_setting.available_av_setting.video_source}' enabled='{editing_av_setting.scratch_av_setting.overrides.video_source}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.video_source}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Video Bitrate: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.video_bitrate}}' suggestion='{editing_av_setting.available_av_setting.video_bitrate}' enabled='{editing_av_setting.scratch_av_setting.overrides.video_bitrate}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.video_bitrate}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Video Encoder: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.video_encoder}}' suggestion='{editing_av_setting.available_av_setting.video_encoder}' enabled='{editing_av_setting.scratch_av_setting.overrides.video_encoder}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.video_encoder}}')
+  Box(weight='0' orient='horizontal')
+    Label {'White Balance: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.auto_white_balance}}' suggestion='{editing_av_setting.available_av_setting.auto_white_balance}' enabled='{editing_av_setting.scratch_av_setting.overrides.auto_white_balance}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.auto_white_balance}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Audio In: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.audio_in}}' suggestion='{editing_av_setting.available_av_setting.audio_in}' enabled='{editing_av_setting.scratch_av_setting.overrides.audio_in}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.audio_in}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Audio Out: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.audio_out}}' suggestion='{editing_av_setting.available_av_setting.audio_out}' enabled='{editing_av_setting.scratch_av_setting.overrides.audio_out}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.audio_out}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Audio Bitrate: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.audio_bitrate}}' suggestion='{editing_av_setting.available_av_setting.audio_bitrate}' enabled='{editing_av_setting.scratch_av_setting.overrides.audio_bitrate}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.audio_bitrate}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Echo Cancellation: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.echo_cancellation}}' suggestion='{editing_av_setting.available_av_setting.echo_cancellation}' enabled='{editing_av_setting.scratch_av_setting.overrides.echo_cancellation}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.echo_cancellation}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Embedded: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting.values.embedded}}' suggestion='{editing_av_setting.available_av_setting.embedded}' enabled='{editing_av_setting.scratch_av_setting.overrides.embedded}')
+    CheckBox(value='{{editing_av_setting.scratch_av_setting.overrides.embedded}}')
+  Button(weight='0' command='{update_av_setting}') Update AV Setting
+'''
+
+  def update_av_setting(self):
+    scratch_av_setting = self.store.state['editing_av_setting']['scratch_av_setting']
+    self.store.dispatch('SET_VALUE', {
+      'path': ['settings', 'av_settings', self.store.state['editing_av_setting']['selected_index']],
+      'value': {**{'name': scratch_av_setting['name']}, **{'overrides': extract_overrides(scratch_av_setting)}}
+    })
+
+class EditAVSettingDefaults(View):
+  geometry  = '500x400+200+200'
+  title     = 'Edit AV Setting Defaults'
+  resizable = ResizeOption.BOTH
+  template = '''\
+Box
+  Box(weight='0' orient='horizontal')
+    Label {'Video In: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.video_in}}' suggestion='{editing_av_setting.available_av_setting.video_in}')
+  Box(weight='0' orient='horizontal')
+    Label {'Video Source: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.video_source}}' suggestion='{editing_av_setting.available_av_setting.video_source}')
+  Box(weight='0' orient='horizontal')
+    Label {'Video Bitrate: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.video_bitrate}}' suggestion='{editing_av_setting.available_av_setting.video_bitrate}')
+  Box(weight='0' orient='horizontal')
+    Label {'Video Encoder: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.video_encoder}}' suggestion='{editing_av_setting.available_av_setting.video_encoder}')
+  Box(weight='0' orient='horizontal')
+    Label {'White Balance: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.auto_white_balance}}' suggestion='{editing_av_setting.available_av_setting.auto_white_balance}')
+  Box(weight='0' orient='horizontal')
+    Label {'Audio In: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.audio_in}}' suggestion='{editing_av_setting.available_av_setting.audio_in}')
+  Box(weight='0' orient='horizontal')
+    Label {'Audio Out: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.audio_out}}' suggestion='{editing_av_setting.available_av_setting.audio_out}')
+  Box(weight='0' orient='horizontal')
+    Label {'Audio Bitrate: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.audio_bitrate}}' suggestion='{editing_av_setting.available_av_setting.audio_bitrate}')
+  Box(weight='0' orient='horizontal')
+    Label {'Echo Cancellation: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.echo_cancellation}}' suggestion='{editing_av_setting.available_av_setting.echo_cancellation}')
+  Box(weight='0' orient='horizontal')
+    Label {'Embedded: '}
+    MyComboBox(value='{{editing_av_setting.scratch_av_setting_defaults.embedded}}' suggestion='{editing_av_setting.available_av_setting.embedded}')
+  Button(weight='0' command='{update_av_setting_defaults}') Update AV Setting Defaults
+'''
+
+  def update_av_setting_defaults(self):
+    scratch_av_setting_defaults = self.store.state['editing_av_setting']['scratch_av_setting_defaults']
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    for k, v in scratch_av_setting_defaults.items():
+      if k in av_setting_defaults and v != av_setting_defaults[k]:
+        print(f'updating default {k} from {av_setting_defaults[k]} to {v}')
+        self.store.dispatch('SET_VALUE', {
+          'path': ['settings', 'av_setting_defaults', k],
+          'value': v
+        })
+
+
+class EditConnection(View):
+  geometry  = '500x400+200+200'
+  title     = 'Edit Connection'
+  resizable = ResizeOption.BOTH
+  template = '''\
+Box
+  Box(weight='0' orient='horizontal')
+    Label {'Connection Name: '}
+    Input(value='{{editing_connection.scratch_connection.name}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Shared Session Id: '}
+    Input(value='{{editing_connection.scratch_connection.shared_session_id}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Selected For Multi-User Connect: '}
+    CheckBox(value='{{editing_connection.scratch_connection.multi_connect_select}}')
+    Label {'Override?'}
+  Box(weight='0' orient='horizontal')
+    Label {'Loopback Mode: '}
+    MyComboBox(value='{{editing_connection.scratch_connection.values.loopback_mode}}' suggestion='{editing_connection.available_connection.loopback_mode}' enabled='{editing_connection.scratch_connection.overrides.loopback_mode}')
+    CheckBox(value='{{editing_connection.scratch_connection.overrides.loopback_mode}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Use Protocol: '}
+    MyComboBox(value='{{editing_connection.scratch_connection.values.protocol}}' suggestion='{editing_connection.available_connection.protocol}' enabled='{editing_connection.scratch_connection.overrides.protocol}')
+    CheckBox(value='{{editing_connection.scratch_connection.overrides.protocol}}')
+  Box(weight='0' if='{editing_connection.scratch_connection.values.protocol in (\\'srt-direct\\',\\'udp-direct\\')}')
+    Label {'Direct Settings: '}
+    Box(weight='0' orient='horizontal')
+      Label {'Direct Local Port: '}
+      Input(value='{{editing_connection.scratch_connection.values.direct_local_port}}' enabled='{editing_connection.scratch_connection.overrides.direct_local_port}')
+      CheckBox(value='{{editing_connection.scratch_connection.overrides.direct_local_port}}')
+    Box(weight='0' orient='horizontal')
+      Label {'Direct Partner Address: '}
+      Input(value='{{editing_connection.scratch_connection.values.direct_partner_address}}' enabled='{editing_connection.scratch_connection.overrides.direct_partner_address}')
+      CheckBox(value='{{editing_connection.scratch_connection.overrides.direct_partner_address}}')
+    Box(weight='0' orient='horizontal')
+      Label {'Direct Partner Port: '}
+      Input(value='{{editing_connection.scratch_connection.values.direct_partner_port}}' enabled='{editing_connection.scratch_connection.overrides.direct_partner_port}')
+      CheckBox(value='{{editing_connection.scratch_connection.overrides.direct_partner_port}}')
+  Box(weight='0' if='{editing_connection.scratch_connection.values.protocol in (\\'srt-proxy\\',\\'udp-proxy\\')}')
+    Label {'Proxy Settings: '}
+    Box(weight='0' orient='horizontal')
+      Label {'Pairing Server Address: '}
+      Input(value='{{editing_connection.scratch_connection.values.udp_hole_puncher_server_address}}' enabled='{editing_connection.scratch_connection.overrides.udp_hole_puncher_server_address}')
+      CheckBox(value='{{editing_connection.scratch_connection.overrides.udp_hole_puncher_server_address}}')
+    Box(weight='0' orient='horizontal')
+      Label {'Pairing Server Port: '}
+      Input(value='{{editing_connection.scratch_connection.values.udp_hole_puncher_server_port}}' enabled='{editing_connection.scratch_connection.overrides.udp_hole_puncher_server_port}')
+      CheckBox(value='{{editing_connection.scratch_connection.overrides.udp_hole_puncher_server_port}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Use Encryption: '}
+    MyComboBox(value='{{editing_connection.scratch_connection.values.encryption}}' suggestion='{editing_connection.available_connection.encryption}' enabled='{editing_connection.scratch_connection.overrides.encryption}')
+    CheckBox(value='{{editing_connection.scratch_connection.overrides.encryption}}')
+  Box(weight='0' if='{editing_connection.scratch_connection.values.encryption == \\'yes\\'}')
+    Label {'Encryption Settings: '}
+    Box(weight='0' orient='horizontal')
+      Label {'OTP In File: '}
+      FileInput(value='{{editing_connection.scratch_connection.otp_in_file}}' rootdir='{settings.otp_file_default_folder}')
+    Box(weight='0' orient='horizontal')
+      Label {'OTP Out File: '}
+      FileInput(value='{{editing_connection.scratch_connection.otp_out_file}}' rootdir='{settings.otp_file_default_folder}')
+    Box(weight='0' orient='horizontal')
+      Label {'OTP In Last Position: '}
+      Input(value='{editing_connection.scratch_connection.otp_in_positions[editing_connection.scratch_connection.otp_in_file]}' enabled='{False}')
+    Box(weight='0' orient='horizontal')
+      Label {'OTP Out Last Position: '}
+      Input(value='{editing_connection.scratch_connection.otp_out_positions[editing_connection.scratch_connection.otp_out_file]}' enabled='{False}')
+  Button(weight='0' command='{update_connection}') Update Connection
+'''
+
+  def update_connection(self):
+    scratch_connection = self.store.state['editing_connection']['scratch_connection']
+    self.store.dispatch('SET_VALUE', {
+      'path': ['settings', 'connections', self.store.state['editing_connection']['selected_index']],
+      'value': {
+        **{
+          'name': scratch_connection['name'],
+          'shared_session_id': scratch_connection['shared_session_id'],
+          'multi_connect_select': scratch_connection['multi_connect_select'],
+          'otp_in_file': scratch_connection['otp_in_file'],
+          'otp_in_positions': scratch_connection['otp_in_positions'],
+          'otp_out_file': scratch_connection['otp_out_file'],
+          'otp_out_positions': scratch_connection['otp_out_positions']
+        },
+        **{'overrides': extract_overrides(scratch_connection)}
+      }
+    })
+
+class EditConnectionDefaults(View):
+  geometry  = '500x400+200+200'
+  title     = 'Edit Connection Defaults'
+  resizable = ResizeOption.BOTH
+  template = '''\
+Box
+  Box(weight='0' orient='horizontal')
+    Label {'Loopback Mode: '}
+    MyComboBox(value='{{editing_connection.scratch_connection_defaults.loopback_mode}}' suggestion='{editing_connection.available_connection.loopback_mode}')
+  Box(weight='0' orient='horizontal')
+    Label {'Use Protocol: '}
+    MyComboBox(value='{{editing_connection.scratch_connection_defaults.protocol}}' suggestion='{editing_connection.available_connection.protocol}')
+  Box(weight='0')
+    Label {'Direct Settings: '}
+    Box(weight='0' orient='horizontal')
+      Label {'Direct Local Port: '}
+      Input(value='{{editing_connection.scratch_connection_defaults.direct_local_port}}')
+    Box(weight='0' orient='horizontal')
+      Label {'Direct Partner Address: '}
+      Input(value='{{editing_connection.scratch_connection_defaults.direct_partner_address}}')
+    Box(weight='0' orient='horizontal')
+      Label {'Direct Partner Port: '}
+      Input(value='{{editing_connection.scratch_connection_defaults.direct_partner_port}}')
+  Box(weight='0')
+    Label {'Proxy Settings: '}
+    Box(weight='0' orient='horizontal')
+      Label {'Pairing Server Address: '}
+      Input(value='{{editing_connection.scratch_connection_defaults.udp_hole_puncher_server_address}}')
+    Box(weight='0' orient='horizontal')
+      Label {'Pairing Server Port: '}
+      Input(value='{{editing_connection.scratch_connection_defaults.udp_hole_puncher_server_port}}')
+  Box(weight='0' orient='horizontal')
+    Label {'Use Encryption: '}
+    MyComboBox(value='{{editing_connection.scratch_connection_defaults.encryption}}' suggestion='{editing_connection.available_connection.encryption}')
+  Button(weight='0' command='{update_connection_defaults}') Update Connection Defaults
+'''
+
+  def update_connection_defaults(self):
+    scratch_connection_defaults = self.store.state['editing_connection']['scratch_connection_defaults']
+    connection_defaults = self.store.state['settings']['connection_defaults']
+    for k, v in scratch_connection_defaults.items():
+      if k in connection_defaults and v != connection_defaults[k]:
+        print(f'updating default {k} from {connection_defaults[k]} to {v}')
+        self.store.dispatch('SET_VALUE', {
+          'path': ['settings', 'connection_defaults', k],
+          'value': v
+        })
+
+
+class Main(View):
+  geometry  = '350x900+100+100'
+  title     = 'OTP Voip Client'
+  resizable = ResizeOption.BOTH
+  template  = '''\
+Box
+  Box(weight='0' orient='horizontal')
+    Label {'My Tag: '}
+    Input(value='{{settings.my_tag}}')
+  Button(weight='0' command='{edit_av_setting_defaults}') Edit AV Setting Defaults
+  Box(weight='0' orient='horizontal')
+    Label {'Selected AV Setting: '}
+    MyComboBox(value='{{settings.av_setting_selected}}' suggestion='{available_av_setting_names}')
+  ScrollFrame AV Settings
+    Box(orient='vertical' for='{av_setting in settings.av_settings}')
+      Box(orient='horizontal')
+        Label {av_setting.name}
+        Button(weight='0' command='{partial(edit_av_setting, av_setting.name)}') Edit
+        Button(weight='0' command='{partial(delete_av_setting, av_setting.name)}') Del
+  Button(weight='0' command='{add_av_setting}') Add AV Setting
+  Box(weight='0' orient='horizontal')
+    Label {'OTP File Default Folder: '}
+    FileInput(value='{{settings.otp_file_default_folder}}' onlydir='{True}')
+  Button(weight='0' command='{edit_connection_defaults}') Edit Connection Defaults
+  ScrollFrame Connections
+    Box(orient='vertical' for='{connection in settings.connections}')
+      Box(orient='horizontal')
+        Label {connection.name}
+        Button(weight='0' command='{partial(edit_connection, connection.name)}') Edit
+        Button(weight='0' command='{partial(delete_connection, connection.name)}') Del
+        Button(weight='0' command='{partial(start_connection, connection.name)}' if='{connection.shared_session_id not in active_connections}') Connect
+        Button(weight='0' command='{partial(stop_connection, connection.name)}' if='{connection.shared_session_id in active_connections}') Disconnect
+        CheckBox(weight='0' value='{{connection.multi_connect_select}}')
+  Button(weight='0' command='{start_multi_connection}' if='{not active_connections}') Start Multi Connection
+  Button(weight='0' command='{stop_multi_connection}' if='{len(active_connections) > 0}') Stop Multi Connection
+  Button(weight='0' command='{add_connection}') Add Connection
+  Button(weight='0' command='{save_settings}') Save Settings
+'''
+
+  # private attributes
+  _edit_av_setting_view = None
+  _edit_av_setting_defaults_view = None
+  _edit_connection_view = None
+  _edit_connection_defaults_view = None
+
+  def edit_av_setting(self, name):
+    list_id = next((i for i, x in enumerate(self.store.state['settings']['av_settings']) if x['name'] == name), -1)
+    if list_id == -1:
+      return
+    self.store.dispatch('SET_VALUE', {
+      'path': ['editing_av_setting', 'selected_index'],
+      'value': list_id
+    })
+    av_setting = self.store.state['settings']['av_settings'][list_id]
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    scratch_av_setting = {**{'name': av_setting['name']}, **build_editor_data(av_setting_defaults, av_setting['overrides'])}
+    print('Editing AV Setting')
+    print(scratch_av_setting)
+    self.store.dispatch('SET_VALUE', {
+      'path': ['editing_av_setting', 'scratch_av_setting'],
+      'value': scratch_av_setting
+    })
+    if not self._edit_av_setting_view or self._edit_av_setting_view._tk is None or self._edit_av_setting_view._tk.winfo_exists() == 0:
+      self._edit_av_setting_view = app.add_view(EditAVSetting(store=store)).widget  # @UndefinedVariable
+      self._edit_av_setting_view.show()
+
+  def edit_av_setting_defaults(self):
+    self.store.dispatch('SET_VALUE', {
+      'path': ['editing_av_setting', 'selected_index'],
+      'value': -1
+    })
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    scratch_av_setting_defaults = copy.deepcopy(av_setting_defaults)
+    print('Editing AV Setting Defaults')
+    print(scratch_av_setting_defaults)
+    self.store.dispatch('SET_VALUE', {
+      'path': ['editing_av_setting', 'scratch_av_setting_defaults'],
+      'value': scratch_av_setting_defaults
+    })
+    if not self._edit_av_setting_defaults_view or self._edit_av_setting_defaults_view._tk is None or self._edit_av_setting_defaults_view._tk.winfo_exists() == 0:
+      self._edit_av_setting_defaults_view = app.add_view(EditAVSettingDefaults(store=store)).widget  # @UndefinedVariable
+      self._edit_av_setting_defaults_view.show()
+
+  def delete_av_setting(self, name):
+    list_id = next((i for i, x in enumerate(self.store.state['settings']['av_settings']) if x['name'] == name), -1)
+    if list_id == -1:
+      return
+    if self.store.state['editing_av_setting']['selected_index'] >= list_id:
+      if self.store.state['editing_av_setting']['selected_index'] == list_id:
+        new_selected_index = -1
+      else:
+        new_selected_index = self.store.state['editing_av_setting']['selected_index'] - 1
+      self.store.dispatch('SET_VALUE', {
+        'path': ['editing_av_setting', 'selected_index'],
+        'value': new_selected_index
+      })
+    self.store.dispatch('SET_VALUE', {
+      'path': ['settings', 'av_settings'],
+      'value': self.store.state['settings']['av_settings'][:list_id] + self.store.state['settings']['av_settings'][list_id+1:]
+    })
+
+  def add_av_setting(self):
+    name = str(uuid4())
+    self.store.dispatch('SET_VALUE', {
+      'path': ['settings', 'av_settings'],
+      'value': self.store.state['settings']['av_settings'] + [{'name': name, 'overrides': {}}]
+    })
+
+  def edit_connection(self, name):
+    list_id = next((i for i, x in enumerate(self.store.state['settings']['connections']) if x['name'] == name), -1)
+    if list_id == -1:
+      return
+    self.store.dispatch('SET_VALUE', {
+      'path': ['editing_connection', 'selected_index'],
+      'value': list_id
+    })
+    connection = self.store.state['settings']['connections'][list_id]
+    connection_defaults = self.store.state['settings']['connection_defaults']
+    scratch_connection = {
+      **{
+        'name': connection['name'],
+        'shared_session_id': connection['shared_session_id'],
+        'multi_connect_select': connection['multi_connect_select'],
+        'otp_in_file': connection['otp_in_file'],
+        'otp_in_positions': connection['otp_in_positions'],
+        'otp_out_file': connection['otp_out_file'],
+        'otp_out_positions': connection['otp_out_positions']
+      },
+      **build_editor_data(connection_defaults, connection['overrides'])
+    }
+    print('Editing Connection')
+    print(scratch_connection)
+    self.store.dispatch('SET_VALUE', {
+      'path': ['editing_connection', 'scratch_connection'],
+      'value': scratch_connection
+    })
+    if not self._edit_connection_view or self._edit_connection_view._tk is None or self._edit_connection_view._tk.winfo_exists() == 0:
+      self._edit_connection_view = app.add_view(EditConnection(store=store)).widget  # @UndefinedVariable
+      self._edit_connection_view.show()
+
+  def edit_connection_defaults(self):
+    self.store.dispatch('SET_VALUE', {
+      'path': ['editing_connection', 'selected_index'],
+      'value': -1
+    })
+    connection_defaults = self.store.state['settings']['connection_defaults']
+    scratch_connection_defaults = copy.deepcopy(connection_defaults)
+    print('Editing Connection Defaults')
+    print(scratch_connection_defaults)
+    self.store.dispatch('SET_VALUE', {
+      'path': ['editing_connection', 'scratch_connection_defaults'],
+      'value': scratch_connection_defaults
+    })
+    if not self._edit_connection_defaults_view or self._edit_connection_defaults_view._tk is None or self._edit_connection_defaults_view._tk.winfo_exists() == 0:
+      self._edit_connection_defaults_view = app.add_view(EditConnectionDefaults(store=store)).widget  # @UndefinedVariable
+      self._edit_connection_defaults_view.show()
+
+  def delete_connection(self, name):
+    list_id = next((i for i, x in enumerate(self.store.state['settings']['connections']) if x['name'] == name), -1)
+    if list_id == -1:
+      return
+    if self.store.state['editing_connection']['selected_index'] >= list_id:
+      if self.store.state['editing_connection']['selected_index'] == list_id:
+        new_selected_index = -1
+      else:
+        new_selected_index = self.store.state['editing_connection']['selected_index'] - 1
+      self.store.dispatch('SET_VALUE', {
+        'path': ['editing_connection', 'selected_index'],
+        'value': new_selected_index
+      })
+    self.store.dispatch('SET_VALUE', {
+      'path': ['settings', 'connections'],
+      'value': self.store.state['settings']['connections'][:list_id] + self.store.state['settings']['connections'][list_id+1:]
+    })
+
+  def add_connection(self):
+    name = str(uuid4())
+    new_connection = {
+      'name': name,
+      'shared_session_id': f'''{self.store.state['settings']['my_tag']}_{name}''',
+      'multi_connect_select': 1,
+      'otp_in_file': '',
+      'otp_in_positions': {'': 999999999999999},
+      'otp_out_file': '',
+      'otp_out_positions': {'': 999999999999999},
+      'overrides': {}
+    }
+    self.store.dispatch('SET_VALUE', {
+      'path': ['settings', 'connections'],
+      'value': self.store.state['settings']['connections'] + [new_connection]
+    })
+
+  async def __start_proxy(self, connection):
+    connection_defaults = self.store.state['settings']['connection_defaults']
+    session_id = connection['shared_session_id']
+    print(f'{session_id} start connection')
+    encryption = connection_defaults['encryption'] == 'yes'
+    if 'encryption' in connection['overrides']:
+      encryption = connection['overrides']['encryption'] == 'yes'
+    udp_hole_puncher_server_address = connection_defaults['udp_hole_puncher_server_address']
+    if 'udp_hole_puncher_server_address' in connection['overrides']:
+      udp_hole_puncher_server_address = connection['overrides']['udp_hole_puncher_server_address']
+    udp_hole_puncher_server_port = int(connection_defaults['udp_hole_puncher_server_port'])
+    if 'udp_hole_puncher_server_port' in connection['overrides']:
+      udp_hole_puncher_server_port = int(connection['overrides']['udp_hole_puncher_server_port'])
+    protocol = connection_defaults['protocol']
+    if 'protocol' in connection['overrides']:
+      protocol = connection['overrides']['protocol']
+    with integrity_lock:
+      active_connections = self.store.state['active_connections']
+      if active_connections:
+        local_relay_address_port = max(ac['local_listen_address'][1] for ac in active_connections.values()) + 1
+      else:
+        local_relay_address_port = 19000
+      local_listen_address_port = local_relay_address_port + 1
+      # TODO: these local addresses need to be dynamic for multi-connection support
+      local_relay_address = ('127.0.0.1', local_relay_address_port)
+      local_listen_address = ('0.0.0.0', local_listen_address_port)
+      active_connections[session_id] = {
+        'local_relay_address': local_relay_address,
+        'local_listen_address': local_listen_address,
+      }
+      self.store.dispatch('SET_VALUE', {
+        'path': ['active_connections'],
+        'value': active_connections
+      })
+    if protocol in ('srt-proxy', 'udp-proxy'):
+      OTPProxy.launch(
+        session_id,
+        connection,
+        encryption,
+        local_relay_address=local_relay_address,
+        local_listen_address=local_listen_address,
+        server_address=(udp_hole_puncher_server_address, udp_hole_puncher_server_port)
+      )
+      while True:
+        with shared_memory_lock:
+          proxy_ready =  shared_memory.get(f'{session_id}.proxy_ready')
+          proxy_stop = shared_memory.get(f'{session_id}.proxy_stop')
+        if proxy_ready == b'true':
+          break
+        if close_client or proxy_stop == b'true':
+          return
+        #print(f'{session_id} waiting for proxy...')
+        await asyncio.sleep(0.05)
+      print(f'{session_id} proxy ready')
+
+  async def __stop_proxy(self, connection):
+    session_id = connection['shared_session_id']
+    connection_defaults = self.store.state['settings']['connection_defaults']
+    protocol = connection_defaults['protocol']
+    if 'protocol' in connection['overrides']:
+      protocol = connection['overrides']['protocol']
+    if protocol in ('srt-proxy', 'udp-proxy'):
+      OTPProxy.end_call(session_id, connection)
+    active_connections = self.store.state['active_connections']
+    del active_connections[session_id]
+    self.store.dispatch('SET_VALUE', {
+      'path': ['active_connections'],
+      'value': active_connections
+    })
+
+  async def start_connection(self, name):
+    if player.player_active() and not player.player_is_active_and_embedded():
+      print('Only embedded player supports addition of users during call.')
+      return
+    list_id = next((i for i, x in enumerate(self.store.state['settings']['connections']) if x['name'] == name), -1)
+    if list_id == -1:
+      return
+    connection = self.store.state['settings']['connections'][list_id]
+    await self.__start_proxy(connection)
+    player.start_connections([connection])
+
+  async def stop_connection(self, name):
+    list_id = next((i for i, x in enumerate(self.store.state['settings']['connections']) if x['name'] == name), -1)
+    if list_id == -1:
+      return
+    connection = self.store.state['settings']['connections'][list_id]
+    session_id = connection['shared_session_id']
+    active_connections = self.store.state['active_connections']
+    if session_id not in active_connections:
+      print(f'{session_id} not fully started (attempting to stop partially failed start)')
+    print(f'{session_id} stop connection')
+    if player.has_active_connection(connection):
+      player.stop_connections([connection])
+    await self.__stop_proxy(connection)
+
+  async def start_multi_connection(self):
+    selected_connections = list(x for x in self.store.state['settings']['connections'] if x['multi_connect_select'] == 1)
+    if not selected_connections:
+      return
+    await asyncio.gather(*[self.__start_proxy(connection) for connection in selected_connections])
+    player.start_connections(selected_connections)
+
+  async def stop_multi_connection(self):
+    selected_connections = list(x for x in self.store.state['settings']['connections'] if x['multi_connect_select'] == 1)
+    if not selected_connections:
+      return
+    active_player_selected_connections = list(x for x in selected_connections if player.has_active_connection(x))
+    if active_player_selected_connections:
+      player.stop_connections(active_player_selected_connections)
+    await asyncio.gather(*[self.__stop_proxy(connection) for connection in selected_connections])
+
+  def save_settings(self):
+    with open(SETTINGS_FILE_PATH, 'w') as config_file:
+      config_file.write(json.dumps(self.store.state['settings'], sort_keys=True, indent=2))
+    shutil.copy(SETTINGS_FILE_PATH, f'''{SETTINGS_FILE_PATH}.{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}''')
+
 
 if __name__ == '__main__':
-    #controls.mainloop()
-    #'''
-    while not close_client:
-        controls.update_idletasks()
-        controls.update()
-        if video_window is not None:
-            video_window.update_idletasks()
-            video_window.update()
-            update_otp_positions()
-        do_shutdown = RASPBERRY_PI_GPIO and (GPIO.input(SHUTDOWN_PIN) == 0)
-        if do_shutdown:
-            close_app()
-        time.sleep(0.05)
-    do_shutdown = RASPBERRY_PI_GPIO and (GPIO.input(SHUTDOWN_PIN) == 0)
-    if do_shutdown:
-        print("launching shutdown...")
-        command = "/usr/bin/sudo /sbin/shutdown -h now"
-        process = subprocess.Popen(command.split(), stdout=subprocess.PIPE)
-        output = process.communicate()[0]
-    print("client closing...")
-    #'''
+  if not os.path.exists(APP_SETTINGS_PATH):
+    os.mkdir(APP_SETTINGS_PATH)
+  if not os.path.exists(SETTINGS_FILE_PATH):
+    print('Initializing default settings...')
+    settings = json.loads('''
+  {
+    "av_setting_defaults": {
+      "audio_bitrate": 24576,
+      "audio_in": "",
+      "audio_out": "",
+      "auto_white_balance": "auto",
+      "echo_cancellation": "yes",
+      "embedded": "yes",
+      "mode": "audio_and_video",
+      "video_in": "/dev/video0",
+      "video_source": "webcam 640x480 30.000",
+      "video_bitrate": 524288,
+      "video_encoder": "x264"
+    },
+    "av_setting_selected": "audio_and_video",
+    "av_settings": [
+      {
+        "name": "audio",
+        "overrides": {
+          "mode": "audio"
+        }
+      },
+      {
+        "name": "video",
+        "overrides": {
+          "mode": "video"
+        }
+      },
+      {
+        "name": "audio_and_video",
+        "overrides": {
+          "mode": "audio_and_video"
+        }
+      }
+    ],
+    "connection_defaults": {
+      "direct_local_port": 9998,
+      "direct_partner_address": "192.168.1.2",
+      "direct_partner_port": 9999,
+      "encryption": "no",
+      "latency": 100,
+      "loopback_mode": "no",
+      "protocol": "srt-proxy",
+      "udp_hole_puncher_server_address": "yourserver.com",
+      "udp_hole_puncher_server_port": 10000
+    },
+    "connections": [
+      {
+        "multi_connect_select": 1,
+        "name": "loopback_test",
+        "otp_in_file": "",
+        "otp_in_positions": {
+          "": 999999999999999
+        },
+        "otp_out_file": "",
+        "otp_out_positions": {
+          "": 999999999999999
+        },
+        "overrides": {
+          "encryption": "no",
+          "loopback_mode": "yes",
+          "protocol": "srt-direct"
+        },
+        "shared_session_id": "loopback_test"
+      }
+    ],
+    "my_tag": "my_tag",
+    "otp_file_default_folder": "~/.otp_client/"
+  }
+    ''')
+    with open(SETTINGS_FILE_PATH, 'w') as config_file:
+      config_file.write(json.dumps(settings, sort_keys=True, indent=2))
+  else:
+    print('Loading settings...')
+    with open(SETTINGS_FILE_PATH) as config_file:
+      settings = json.loads(config_file.read())
+    print(settings)
+    shutil.copy(SETTINGS_FILE_PATH, f'''{SETTINGS_FILE_PATH}.{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}''')
+
+  webcam_capabilities = {}
+  for video_in in glob.glob('/dev/video*'):
+    if RASPBERRY_PI and video_in == '/dev/video0':
+      webcam_capabilities_sub = [
+        'rpicamsrc 320x240 30.000',
+        'rpicamsrc 640x480 30.000',
+        'rpicamsrc 800x448 30.000',
+        'rpicamsrc 848x480 30.000',
+        'rpicamsrc 1280x720 30.000',
+        'rpicamsrc 1920x1080 30.000'
+      ]
+    else:
+      webcam_capabilities_sub = []
+    p = subprocess.Popen(['v4l2-ctl', '--device', video_in, '--list-formats-ext'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output, _ = p.communicate(b"")
+    #rc = p.returncode
+    #print(output)
+    matches = re.findall(rb'\[\d+\]: \'(?P<format>MJPG|\w+)\'|Size\: Discrete (?P<resolution>\d+x\d+)|(?P<fps>\d+.\d+) fps', output, re.DOTALL)  # @UndefinedVariable
+    for t_wc_format, t_resolution, t_fps in matches:
+      if t_wc_format:
+        wc_format = t_wc_format.decode('utf8')
+        if wc_format == 'MJPG':
+          wc_format = 'webcam-jpeg'
+        else:
+          wc_format = 'webcam'
+      elif t_resolution:
+        resolution = t_resolution.decode('utf8')
+      else:
+        assert t_fps
+        webcam_capabilities_sub.append(f'''{wc_format} {resolution} {t_fps.decode('utf8')}''')
+    if webcam_capabilities_sub:
+      #print(webcam_capabilities_sub)
+      webcam_capabilities[video_in] = webcam_capabilities_sub
+  print('Webcam Capabilities...')
+  print(webcam_capabilities)
+
+  awb_modes = {'off':0,'auto':1,'sunlight':2,'cloudy':3,'shade':4,'tungsten':5,'fluorescent':6,'incadescent':7,'flash':8,'horizon':9}
+
+  store = create_store({
+  }, {
+    'settings': settings,
+    'available_av_setting_names': list(s['name'] for s in settings['av_settings']),
+    'editing_av_setting': {
+      'selected_index': -1,
+      'webcam_capabilities': webcam_capabilities,
+      'scratch_av_setting': {
+        'name': '',
+        'values': settings['av_setting_defaults'],
+        'overrides': {k: False for k in settings['av_setting_defaults']},
+      },
+      'scratch_av_setting_defaults': copy.deepcopy(settings['av_setting_defaults']),
+      'available_av_setting': {
+        'mode': ['audio', 'video', 'audio_and_video'],
+        'video_in': list(webcam_capabilities.keys()),
+        'video_source': [''],
+        'video_bitrate': ['65536','98304','131072','196608','262144','327680','393216','524288','655360','786432','1048576'],
+        'video_encoder': ['v4l2h264enc', 'x264', 'rpicamsrc'] if RASPBERRY_PI else ['x264'],
+        'auto_white_balance': list(awb_modes.keys()),
+        'audio_in': [p.name for p in pulse.source_list()],
+        'audio_out': [p.name for p in pulse.sink_list()],
+        'audio_bitrate': ['8192','12288','16384','24576','49152','65536','98304','131072'],
+        'echo_cancellation': ['yes', 'no'],
+        'embedded': ['yes', 'no']
+      }
+    },
+    'editing_connection': {
+      'selected_index': -1,
+      'scratch_connection': {
+        'name': '',
+        'shared_session_id': '',
+        'multi_connect_select': 1,
+        'otp_in_file': '',
+        'otp_in_positions': {'': 999999999999999},
+        'otp_out_file': '',
+        'otp_out_positions': {'': 999999999999999},
+        'values': settings['connection_defaults'],
+        'overrides': {k: False for k in settings['connection_defaults']},
+      },
+      'scratch_connection_defaults': copy.deepcopy(settings['connection_defaults']),
+      'available_connection': {
+        'loopback_mode': ['yes', 'no'],
+        'encryption':['yes', 'no'],
+        'protocol': ['srt-proxy','srt-direct','udp-direct','udp-proxy'],
+        'latency': ['100','200','300','400','500','600','800','1000','1500','2000'],
+      }
+    },
+    'active_connections': {}
+  })
+
+  def on_change_video_in(_):
+    print('on_change_video_in')
+    video_in = store.state['editing_av_setting']['scratch_av_setting']['values']['video_in']
+    webcam_capabilities_sub = store.state['editing_av_setting']['webcam_capabilities'][video_in]
+    old_selected_video_source = store.state['editing_av_setting']['scratch_av_setting']['values']['video_source']
+    new_video_sources = webcam_capabilities_sub
+    store.dispatch('SET_VALUE', {
+      'path': ['editing_av_setting', 'available_av_setting', 'video_source'],
+      'value': new_video_sources
+    })
+    if old_selected_video_source not in new_video_sources:
+      print(f'changing video_source from {old_selected_video_source} to {new_video_sources[0]}')
+      selected_video_source = new_video_sources[0]
+      store.dispatch('SET_VALUE', {
+        'path': ['editing_av_setting', 'scratch_av_setting', 'values', 'video_source'],
+        'value': selected_video_source
+      })
+    av_setting_defaults = store.state['settings']['av_setting_defaults']
+    repaired_editor_data, repaired = repair_editor_data_honor_values(av_setting_defaults, store.state['editing_av_setting']['scratch_av_setting'])
+    if repaired:
+      print("repaired")
+      print(repaired_editor_data)
+      store.dispatch('SET_VALUE', {
+        'path': ['editing_av_setting', 'scratch_av_setting'],
+        'value': repaired_editor_data
+      })
+
+  def on_change_av_setting_overrides(_):
+    av_setting_defaults = store.state['settings']['av_setting_defaults']
+    scratch_av_setting = store.state['editing_av_setting']['scratch_av_setting']
+    repaired_editor_data, repaired = repair_editor_data_honor_checkbox(av_setting_defaults, scratch_av_setting)
+    if repaired:
+      store.dispatch('SET_VALUE', {
+        'path': ['editing_av_setting', 'scratch_av_setting'],
+        'value': repaired_editor_data
+      })
+
+  def on_change_connection_overrides(_):
+    connection_defaults = store.state['settings']['connection_defaults']
+    scratch_connection = store.state['editing_connection']['scratch_connection']
+    repaired_editor_data, repaired = repair_editor_data_honor_checkbox(connection_defaults, scratch_connection)
+    if repaired:
+      store.dispatch('SET_VALUE', {
+        'path': ['editing_connection', 'scratch_connection'],
+        'value': repaired_editor_data
+      })
+
+  def on_change_otp_out_file(_):
+    scratch_otp_out_positions = store.state['editing_connection']['scratch_connection']['otp_out_positions']
+    scratch_otp_out_file = store.state['editing_connection']['scratch_connection']['otp_out_file']
+    if scratch_otp_out_file not in scratch_otp_out_positions:
+      scratch_otp_out_positions[scratch_otp_out_file] = os.path.getsize(scratch_otp_out_file)
+    store.dispatch('SET_VALUE', {
+      'path': ['editing_connection', 'scratch_connection', 'otp_out_positions'],
+      'value': scratch_otp_out_positions
+    })
+
+  def on_change_otp_in_file(_):
+    scratch_otp_in_positions = store.state['editing_connection']['scratch_connection']['otp_in_positions']
+    scratch_otp_in_file = store.state['editing_connection']['scratch_connection']['otp_in_file']
+    if scratch_otp_in_file not in scratch_otp_in_positions:
+      scratch_otp_in_positions[scratch_otp_in_file] = os.path.getsize(scratch_otp_in_file)
+    store.dispatch('SET_VALUE', {
+      'path': ['editing_connection', 'scratch_connection', 'otp_in_positions'],
+      'value': scratch_otp_in_positions
+    })
+
+  def on_change_av_settings(_):
+    updated_available_setting_names = set(s['name'] for s in store.state['settings']['av_settings'])
+    available_av_setting_names = copy.deepcopy(store.state['available_av_setting_names'])
+    old_available_av_setting_names = set(available_av_setting_names)
+    to_remove = old_available_av_setting_names.difference(updated_available_setting_names)
+    if to_remove:
+      for r in to_remove:
+        available_av_setting_names.remove(r)
+    to_add = updated_available_setting_names.difference(old_available_av_setting_names)
+    if to_add:
+      available_av_setting_names += list(to_add)
+    if to_remove or to_add:
+      store.dispatch('SET_VALUE', {
+        'path': ['available_av_setting_names'],
+        'value': available_av_setting_names
+      })
+
+  video_in_observer = store.select_by_path('editing_av_setting.scratch_av_setting.values.video_in')
+  video_in_observer.subscribe(on_change_video_in)
+  for k in store.state['settings']['av_setting_defaults'].keys():
+    av_setting_override_observer = store.select_by_path(f'editing_av_setting.scratch_av_setting.overrides.{k}')
+    av_setting_override_observer.subscribe(on_change_av_setting_overrides)
+  for k in store.state['settings']['connection_defaults'].keys():
+    connection_override_observer = store.select_by_path(f'editing_connection.scratch_connection.overrides.{k}')
+    connection_override_observer.subscribe(on_change_connection_overrides)
+  new_otp_out_file_observer = store.select_by_path(f'editing_connection.scratch_connection.otp_out_file')
+  new_otp_out_file_observer.subscribe(on_change_otp_out_file)
+  new_otp_in_file_observer = store.select_by_path(f'editing_connection.scratch_connection.otp_in_file')
+  new_otp_in_file_observer.subscribe(on_change_otp_out_file)
+  av_settings_observer = store.select_by_path(f'settings.av_settings')
+  av_settings_observer.subscribe(on_change_av_settings)
+
+  loop = asyncio.get_event_loop()
+  player = Player(store=store)
+  player_task = player.create_player_task(loop)
+  proxy_task = OTPProxy.create_proxy_task(store, loop)
+  app.add_custom_widget('MyComboBox', MyComboBox)  # @UndefinedVariable
+  app.setup(store=store, rootView=Main, loop=loop, font={"family": "roboto", "size": "10"}, player_task=player_task, proxy_task=proxy_task)  # @UndefinedVariable
+  app.run()  # @UndefinedVariable
+
+  print(store.state)
+
+  print('Saving settings...')
+  print(store.state['settings'])
+  with open(SETTINGS_FILE_PATH, 'w') as config_file:
+    config_file.write(json.dumps(store.state['settings'], sort_keys=True, indent=2))
+  shutil.copy(SETTINGS_FILE_PATH, f'''{SETTINGS_FILE_PATH}.{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}''')
+
+
+  print('client closing...')
+
 

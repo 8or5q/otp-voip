@@ -1,0 +1,3 @@
+otp_voip_client usr/bin/
+otp_voip_server usr/bin/
+otp_voip_generate_bad_random_data usr/bin/

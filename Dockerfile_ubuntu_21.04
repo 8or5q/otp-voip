@@ -1,0 +1,31 @@
+FROM ubuntu:21.04 as base_dependencies
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/
+
+RUN DEBIAN_FRONTEND=noninteractive apt update -y \
+ && DEBIAN_FRONTEND=noninteractive apt --no-install-recommends -y full-upgrade \
+ && DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y \
+      software-properties-common \
+      gpg-agent \
+      sudo \
+      gdebi-core \
+      xz-utils
+
+FROM base_dependencies as chat_client
+
+# required to avoid docker only install error "_tkinter.TclError: no display name and no $DISPLAY environment variable"
+RUN DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y \
+      tk8.6
+COPY ubuntu_21.04/tkdnd-2.9.2-linux-x64.tgz /
+RUN tar -zxf tkdnd-2.9.2-linux-x64.tgz --directory /usr/share/tcltk/tcl8.6
+
+COPY ubuntu_21.04/otp-voip_0.0.4_all.deb /
+RUN DEBIAN_FRONTEND=noninteractive gdebi --non-interactive otp-voip_0.0.4_all.deb
+# ignore error "_tkinter.TclError: no display name and no $DISPLAY environment variable" it seems to still install dependencies fine
+
+#RUN DEBIAN_FRONTEND=noninteractive add-apt-repository ppa:ikagyse/ppa \
+# && DEBIAN_FRONTEND=noninteractive apt update -y \
+# && DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y otp-voip
+
+# sudo docker build -t otp-voip/otp-voip:amd64-ubuntu-21.04 -f Dockerfile_ubuntu_21.04 .
+

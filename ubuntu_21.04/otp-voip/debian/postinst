@@ -1,0 +1,6 @@
+#!/bin/bash
+
+pip3 install numpy pulsectl
+pip3 install "layoutx[more_widgets, styles] @ git+https://github.com/Bomberus/LayoutX.git"
+python3 -m layoutx.install_tkdnd
+pip3 install pyshmht3
