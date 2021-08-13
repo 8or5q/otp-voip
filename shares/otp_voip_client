@@ -456,7 +456,7 @@ def set_video_in(video_in, reset_video_source=True):
         webcam_capabilities = {'rpicamsrc': {'320x240': [30], '640x480': [30], '800x448': [30], '848x480': [30], '1280x720': [30], '1920x1080': [30]}}
     else:
         webcam_capabilities = {}
-    p = subprocess.Popen(['v4l2-ctl', '--device', '/dev/video0', '--list-formats-ext'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(['v4l2-ctl', '--device', video_in, '--list-formats-ext'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, err = p.communicate(b"")
     rc = p.returncode
     matches = re.findall(rb'\[\d+\]: \'(?P<format>MJPG|\w+)\'|Size\: Discrete (?P<resolution>\d+x\d+)|(?P<fps>\d+.\d+) fps', output, re.DOTALL)
@@ -534,7 +534,7 @@ audio_frame = create_toggled_frame(controls, 'Audio', False)
 use_echo_cancellation_option = PlayerMenuOption(audio_frame, 'Echo Cancellation:', 'echo_cancellation', tkinter.StringVar, None, ['yes', 'no'], 'yes' if do_autocall else config_main['echo_cancellation'])
 audio_bitrate_option = PlayerMenuOption(audio_frame, 'Audio Bitrate:', 'audio_bitrate', tkinter.IntVar, functools.partial(set_option, 'opusenc0', 'bitrate'), [8192,12288,16384,24576,49152,65536,98304,131072], config_main['audio_bitrate'])
 audio_in_list = [p.name for p in pulse.source_list()]
-audio_in_option = PlayerMenuOption(audio_frame, 'Sound In:', 'audio_in', tkinter.StringVar, None, audio_in_list, config_main['audio_in'] if config_main['audio_in'] in audio_in_list else audio_in_list[0])
+audio_in_option = PlayerMenuOption(audio_frame, 'Sound In:', 'audio_in', tkinter.StringVar, None, audio_in_list, config_main['audio_in'] if config_main['audio_in'] in audio_in_list else sorted(audio_in_list)[0])
 audio_out_list = [p.name for p in pulse.sink_list()]
 audio_out_option = PlayerMenuOption(audio_frame, 'Sound Out:', 'audio_out', tkinter.StringVar, None, audio_out_list, config_main['audio_out'] if config_main['audio_out'] in audio_out_list else audio_out_list[0])
 
