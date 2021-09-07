@@ -16,6 +16,7 @@ from layoutx.store import create_store
 from layoutx.view import View, ResizeOption  # @UnusedImport
 from layoutx.widgets import Widget
 import logging  # @UnusedImport
+import math
 import multiprocessing
 import numpy
 import os
@@ -313,7 +314,7 @@ class Player(object):
     self.__video_frame = None
     self.__video_frame_window_id = None
     self.__player_process = None
-    self.__active_connections = set()
+    self.__player_active_connections = dict()
     self.store = store
 
   def player_active(self):
@@ -334,82 +335,92 @@ class Player(object):
 
   def has_active_connection(self, connection):
     session_id = connection['shared_session_id']
-    return session_id in self.__active_connections
+    return session_id in self.__player_active_connections
 
   def start_connections(self, connections):
     assert not self.player_active() or self.player_is_active_and_embedded(), 'Only embedded player supports addition of users during call.'
-    self.__active_connections.update({c['shared_session_id'] for c in connections})
-    connection_defaults = self.store.state['settings']['connection_defaults']  # @UnusedVariable
+    used_mixer_indices = {ac['mixer_idx'] for ac in self.__player_active_connections.values()}
+    available_mixer_indices = [idx for idx in range(1000) if idx not in used_mixer_indices]
+    self.__player_active_connections.update({c['shared_session_id']: {'mixer_idx': available_mixer_indices[idx]}  for idx, c in enumerate(connections)})
     av_setting_defaults = self.store.state['settings']['av_setting_defaults']
     av_setting = list(x for x in self.store.state['settings']['av_settings'] if x['name'] == self.store.state['settings']['av_setting_selected'])[0]
     embedded = av_setting_defaults['embedded']
     if 'embedded' in av_setting:
       embedded = av_setting['embedded']
-    if embedded == 'yes':
-      def on_sync_message(bus, message, video_frame_window_id):
-        if not message.get_structure() is None:
-          if message.get_structure().get_name() == 'prepare-window-handle':
-            print('video_frame_window_id: ')
-            print(video_frame_window_id)
-            image_sink = message.src
-            image_sink.set_property("force-aspect-ratio", True)
-            image_sink.set_window_handle(video_frame_window_id)
-            print(f'set_window_handle: {video_frame_window_id}')
-
-      self.__video_window = tk.Toplevel()
-      self.__video_window.protocol('WM_DELETE_WINDOW', functools.partial(self.stop_connections, None))
-      self.__video_window.geometry('1280x720')
-      #self.__video_window.attributes('-zoomed', True)
-
-      def toggle_fullscreen(event=None):
-        self.__video_window.attributes("-fullscreen", not self.__video_window.attributes("-fullscreen"))
-        return "break"
-
-      def end_fullscreen(event=None):
-        self.__video_window.attributes("-fullscreen", False)
-        return "break"
-
-      self.__video_window.bind("<F11>", toggle_fullscreen)
-      self.__video_window.bind("<Escape>", end_fullscreen)
-
-      self.__video_frame = tk.Frame(self.__video_window, bg='#000000')
-      self.__video_frame.pack(side=tk.BOTTOM,anchor=tk.S,expand=tk.YES,fill=tk.BOTH)
-
-      self.__video_frame_window_id = self.__video_frame.winfo_id()
-      print(f'video_frame_window_id: {self.__video_frame_window_id}')
-
-      self.__video_window.update_idletasks()
-      self.__video_window.update()
-
-    gstreamer_launch_command = self.build_complete_gstreamer_launch_command(connections, av_setting)
-    print(gstreamer_launch_command)
-    if embedded == 'yes':
-        self.__player = Gst.parse_launch(gstreamer_launch_command)
-        bus = self.__player.get_bus()
-        bus.add_signal_watch()
-        bus.enable_sync_message_emission()
-        bus.connect('sync-message::element', on_sync_message, self.__video_frame_window_id)
-        self.__player.set_state(Gst.State.PLAYING)
+    if self.player_active():
+      assert embedded == 'yes'
+      for connection in connections:
+        self.add_gstreamer_connection(connection, av_setting)
+      self.cleanup_sub_windows(av_setting)
     else:
-        assert embedded == 'no'
-        arguments = ['gst-launch-1.0']
-        arguments.extend(gstreamer_launch_command.split(' '))
-        self.__player_process = subprocess.Popen(arguments)
+      connection_defaults = self.store.state['settings']['connection_defaults']  # @UnusedVariable
+
+      if embedded == 'yes':
+        def on_sync_message(bus, message, video_frame_window_id):
+          if not message.get_structure() is None:
+            if message.get_structure().get_name() == 'prepare-window-handle':
+              print('video_frame_window_id: ')
+              print(video_frame_window_id)
+              image_sink = message.src
+              image_sink.set_property('force-aspect-ratio', True)
+              image_sink.set_window_handle(video_frame_window_id)
+              print(f'set_window_handle: {video_frame_window_id}')
+
+        self.__video_window = tk.Toplevel()
+        self.__video_window.protocol('WM_DELETE_WINDOW', functools.partial(self.stop_connections, None))
+        self.__video_window.geometry('1280x720')
+        #self.__video_window.attributes('-zoomed', True)
+
+        def toggle_fullscreen(event=None):
+          self.__video_window.attributes('-fullscreen', not self.__video_window.attributes('-fullscreen'))
+          return 'break'
+
+        def end_fullscreen(event=None):
+          self.__video_window.attributes('-fullscreen', False)
+          return 'break'
+
+        self.__video_window.bind('<F11>', toggle_fullscreen)
+        self.__video_window.bind('<Escape>', end_fullscreen)
+
+        self.__video_frame = tk.Frame(self.__video_window, bg='#000000')
+        self.__video_frame.pack(side=tk.BOTTOM,anchor=tk.S,expand=tk.YES,fill=tk.BOTH)
+
+        self.__video_frame_window_id = self.__video_frame.winfo_id()
+        print(f'video_frame_window_id: {self.__video_frame_window_id}')
+
+        self.__video_window.update_idletasks()
+        self.__video_window.update()
+
+      gstreamer_launch_command = self.build_complete_gstreamer_launch_command(connections, av_setting)
+      print(gstreamer_launch_command)
+      if embedded == 'yes':
+          self.__player = Gst.parse_launch(gstreamer_launch_command)
+          bus = self.__player.get_bus()
+          bus.add_signal_watch()
+          bus.enable_sync_message_emission()
+          bus.connect('sync-message::element', on_sync_message, self.__video_frame_window_id)
+          self.__player.set_state(Gst.State.PLAYING)
+      else:
+          assert embedded == 'no'
+          arguments = ['gst-launch-1.0']
+          arguments.extend(gstreamer_launch_command.split(' '))
+          self.__player_process = subprocess.Popen(arguments)
 
   def stop_connections(self, connections):
     # connection: None indicates window closed
-    if connections is None:
-      self.__active_connections = set()
-    else:
-      for connection in connections:
-        self.__active_connections.remove(connection['shared_session_id'])
-        # TODO: remove gstreamer elements related to connection being stopped
     av_setting_defaults = self.store.state['settings']['av_setting_defaults']
     av_setting = list(x for x in self.store.state['settings']['av_settings'] if x['name'] == self.store.state['settings']['av_setting_selected'])[0]
     embedded = av_setting_defaults['embedded']
     if 'embedded' in av_setting:
       embedded = av_setting['embedded']
-    if not self.__active_connections or embedded == 'no':
+    if connections is None:
+      self.__player_active_connections = dict()
+    else:
+      for connection in connections:
+        self.remove_gstreamer_connection(connection, av_setting)
+        self.__player_active_connections.pop(connection['shared_session_id'])
+      self.cleanup_sub_windows(av_setting)
+    if not self.__player_active_connections or embedded == 'no':
       if embedded == 'yes':
         if self.__player is not None:
           self.__player.set_state(Gst.State.NULL)
@@ -425,6 +436,287 @@ class Player(object):
           self.__player_process.kill()
           self.__player_process = None
 
+  def cleanup_sub_windows(self, av_setting):
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    av_setting_data = copy.deepcopy(av_setting_defaults)
+    for k, v in av_setting['overrides'].items():
+      av_setting_data[k] = copy.deepcopy(v)
+    mode = av_setting_data['mode']
+    if mode not in ('video', 'audio_and_video'):
+      return
+    _, resolution, _ = av_setting_data['video_source'].split(' ')
+    resolution_x, resolution_y = resolution.split('x')
+    resolution_x = int(resolution_x)
+    resolution_y = int(resolution_y)
+    display_resolution_x = resolution_x
+    display_resolution_y = resolution_y
+    screen_resolution_x, _ = app.resolution()
+    #x_tile_count = int(int(screen_resolution_x) / display_resolution_x)
+    x_tile_count = math.ceil(math.sqrt(len(self.__player_active_connections)))
+    glvideomixer = self.__player.get_child_by_name(f'glvideomixer')
+    for idx, player_active_connection_sub in enumerate(self.__player_active_connections.values()):
+      glvideomixer_pad_sub = glvideomixer.get_child_by_name(f'''sink_{player_active_connection_sub['mixer_idx']}''')
+      glvideomixer_pad_sub.set_property('xpos', (idx%x_tile_count)*display_resolution_x)
+      glvideomixer_pad_sub.set_property('ypos', int(idx/x_tile_count)*display_resolution_y)
+      glvideomixer_pad_sub.set_property('width', int(display_resolution_x))
+      glvideomixer_pad_sub.set_property('height', int(display_resolution_y))
+
+  def add_gstreamer_connection(self, connection, av_setting):
+    active_connections = self.store.state['active_connections']
+    connection_defaults = self.store.state['settings']['connection_defaults']
+    video_caps = Gst.Caps.from_string('video/x-raw')
+    audio_caps = Gst.Caps.from_string('audio/x-raw,format=S16LE,rate=48000,channels=2')
+
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    av_setting_data = copy.deepcopy(av_setting_defaults)
+    for k, v in av_setting['overrides'].items():
+      av_setting_data[k] = copy.deepcopy(v)
+    mode = av_setting_data['mode']
+    _, resolution, _ = av_setting_data['video_source'].split(' ')
+    resolution_x, resolution_y = resolution.split('x')
+    resolution_x = int(resolution_x)
+    resolution_y = int(resolution_y)
+
+    connection_data = copy.deepcopy(connection_defaults)
+    for k, v in connection['overrides'].items():
+      connection_data[k] = copy.deepcopy(v)
+    direct_local_port = connection_data['direct_local_port']
+    direct_partner_address = connection_data['direct_partner_address']
+    direct_partner_port = connection_data['direct_partner_port']
+    loopback_mode = connection_data['loopback_mode']
+    protocol = connection_data['protocol']
+    session_id = connection['shared_session_id']
+    active_connection = active_connections[session_id]
+    local_relay_address = active_connection['local_relay_address']
+    local_listen_address = active_connection['local_listen_address']
+    player_active_connection = self.__player_active_connections[session_id]
+
+    #Gst.debug_bin_to_dot_file_with_ts(self.__player, Gst.DebugGraphDetails.VERBOSE, 'graph')
+
+    if protocol == 'srt-proxy':
+      network_src = Gst.ElementFactory.make('srtsrc', f'srtsrc_{session_id}')
+      network_src.set_property('uri', f'srt://127.0.0.1:{local_listen_address[1]}/')
+      network_src.set_property('localaddress', f'127.0.0.1')
+      network_src.set_property('localport', int(local_relay_address[1]))
+      network_src.set_property('mode', f'caller')
+    elif protocol == 'udp-proxy':
+      network_src = Gst.ElementFactory.make('udpsrc', f'udpsrc_{session_id}')
+      network_src.set_property('port', int(local_relay_address[1]))
+    else:
+      assert protocol in ('srt-direct', 'udp-direct')
+      if loopback_mode == 'yes':
+        partner_address = '127.0.0.1'
+        partner_port = direct_local_port
+      else:
+        partner_address = direct_partner_address
+        partner_port = direct_partner_port
+      if protocol == 'srt-direct':
+        network_src = Gst.ElementFactory.make('srtsrc', f'srtsrc_{session_id}')
+        network_src.set_property('uri', f'srt://{partner_address}:{partner_port}/')
+        network_src.set_property('mode', f'caller')
+      elif protocol == 'udp-direct':
+        network_src = Gst.ElementFactory.make('udpsrc', f'udpsrc_{session_id}')
+        network_src.set_property('port', int(direct_local_port[1]))
+    self.__player.add(network_src)
+    tsparse_queue = Gst.ElementFactory.make('queue', f'tsparse_queue_{session_id}')
+    self.__player.add(tsparse_queue)
+    network_src.link(tsparse_queue)
+    tsparse = Gst.ElementFactory.make('tsparse', f'tsparse_{session_id}')
+    self.__player.add(tsparse)
+    tsparse_queue.link(tsparse)
+    tsdemux = Gst.ElementFactory.make('tsdemux', f'tsdemux_{session_id}')
+    if not RASPBERRY_PI:
+      tsdemux.set_property('latency', 50)
+    self.__player.add(tsdemux)
+    tsparse.link(tsdemux)
+    if mode in ('video', 'audio_and_video'):
+      h264parse = Gst.ElementFactory.make('h264parse', f'h264parse_{session_id}')
+      self.__player.add(h264parse)
+      #tsdemux.link(h264parse)
+      decoder_queue = Gst.ElementFactory.make('queue', f'decoder_queue_{session_id}')
+      self.__player.add(decoder_queue)
+      h264parse.link(decoder_queue)
+      if RASPBERRY_PI:
+        decoder = Gst.ElementFactory.make('decodebin', f'decodebin_{session_id}')
+        decoder.set_property('capture-io-mode', 4)
+        self.__player.add(decoder)
+        decoder_queue.link(decoder)
+      else:
+        decoder = Gst.ElementFactory.make('avdec_h264', f'avdec_h264_{session_id}')
+        self.__player.add(decoder)
+        decoder_queue.link(decoder)
+      glvideomixer_queue = Gst.ElementFactory.make('queue', f'glvideomixer_queue_{session_id}')
+      self.__player.add(glvideomixer_queue)
+      decoder.link(glvideomixer_queue)
+      glvideomixer = self.__player.get_child_by_name(f'glvideomixer')
+      glvideomixer_pad = glvideomixer.get_request_pad(f'''sink_{player_active_connection['mixer_idx']}''')
+      glvideomixer_queue.get_static_pad('src').link(glvideomixer_pad)
+    if mode in ('audio', 'audio_and_video'):
+      opusdec_queue = Gst.ElementFactory.make('queue', f'opusdec_queue_{session_id}')
+      self.__player.add(opusdec_queue)
+      #tsdemux.link(opusdec_queue)
+      opusdec = Gst.ElementFactory.make('opusdec', f'opusdec_{session_id}')
+      self.__player.add(opusdec)
+      opusdec_queue.link(opusdec)
+      audiomixer_queue = Gst.ElementFactory.make('queue', f'audiomixer_queue_{session_id}')
+      self.__player.add(audiomixer_queue)
+      opusdec.link(audiomixer_queue)
+      audiomixer = self.__player.get_child_by_name(f'audiomixer')
+      audiomixer_pad = audiomixer.get_request_pad(f'''sink_{player_active_connection['mixer_idx']}''')
+      audiomixer_queue.get_static_pad('src').link(audiomixer_pad)
+
+    def tsdemux_pad_added(demuxer, pad):
+      if pad.get_property("template").name_template.startswith('video'):
+        h264parse_pad = h264parse.get_static_pad("sink")
+        pad.link(h264parse_pad)
+      elif pad.get_property("template").name_template.startswith('audio'):
+        opusdec_queue_pad = opusdec_queue.get_static_pad("sink")
+        pad.link(opusdec_queue_pad)
+    tsdemux.connect('pad-added', tsdemux_pad_added)
+
+    mpegtsmux_tee = self.__player.get_child_by_name(f'mpegtsmux_tee')
+    network_sink_queue = Gst.ElementFactory.make('queue', f'network_sink_queue_{session_id}')
+    self.__player.add(network_sink_queue)
+#     mpegtsmux_tee_pad_templ = mpegtsmux_tee.get_pad_template("src_%u")
+#     mpegtsmux_tee_pad = mpegtsmux_tee.request_pad(mpegtsmux_tee_pad_templ)
+#     mpegtsmux_tee_pad.link(network_sink_queue.get_static_pad('sink'))
+    mpegtsmux_tee.link(network_sink_queue)
+    if protocol == 'srt-proxy':
+      network_sink = Gst.ElementFactory.make('srtsink', f'srtsink_{session_id}')
+      network_sink.set_property('uri', f'srt://127.0.0.1:{local_listen_address[1]}/')
+      network_sink.set_property('localaddress', f'127.0.0.1')
+      network_sink.set_property('localport', int(local_relay_address[1]))
+      network_sink.set_property('mode', f'listener')
+    elif protocol == 'udp-proxy':
+      network_sink = Gst.ElementFactory.make('udpsink', f'udpsink_{session_id}')
+      network_sink.set_property('host', f'127.0.0.1')
+      network_sink.set_property('port', int(local_listen_address[1]))
+    else:
+      assert protocol in ('srt-direct', 'udp-direct')
+      if loopback_mode == 'yes':
+        partner_address = '127.0.0.1'
+        partner_port = direct_local_port
+      else:
+        partner_address = direct_partner_address
+        partner_port = direct_partner_port
+      if protocol == 'srt-direct':
+        network_sink = Gst.ElementFactory.make('srtsink', f'srtsink_{session_id}')
+        network_sink.set_property('uri', f'srt://{partner_address}:{partner_port}/')
+        network_sink.set_property('localaddress', f'0.0.0.0')
+        network_sink.set_property('localport', int(direct_local_port))
+        network_sink.set_property('mode', f'listener')
+      elif protocol == 'udp-direct':
+        network_sink = Gst.ElementFactory.make('udpsink', f'udpsink_{session_id}')
+        network_sink.set_property('host', f'{partner_address}')
+        network_sink.set_property('port', int(partner_port))
+    network_sink.set_async_enabled(False)
+    network_sink.set_sync(False)
+    self.__player.add(network_sink)
+    network_sink_queue.link(network_sink)
+
+    if mode in ('video', 'audio_and_video'):
+      glvideomixer_queue.sync_state_with_parent()
+      decoder.sync_state_with_parent()
+      decoder_queue.sync_state_with_parent()
+      h264parse.sync_state_with_parent()
+    if mode in ('audio', 'audio_and_video'):
+      audiomixer_queue.sync_state_with_parent()
+      opusdec.sync_state_with_parent()
+      opusdec_queue.sync_state_with_parent()
+    tsdemux.sync_state_with_parent()
+    tsparse.sync_state_with_parent()
+    tsparse_queue.sync_state_with_parent()
+    network_src.sync_state_with_parent()
+    network_sink.sync_state_with_parent()
+    network_sink_queue.sync_state_with_parent()
+
+    #Gst.debug_bin_to_dot_file_with_ts(self.__player, Gst.DebugGraphDetails.VERBOSE, 'graph')
+
+
+  def remove_gstreamer_connection(self, connection, av_setting):
+    connection_defaults = self.store.state['settings']['connection_defaults']
+
+    av_setting_defaults = self.store.state['settings']['av_setting_defaults']
+    av_setting_data = copy.deepcopy(av_setting_defaults)
+    for k, v in av_setting['overrides'].items():
+      av_setting_data[k] = copy.deepcopy(v)
+    mode = av_setting_data['mode']
+    _, resolution, _ = av_setting_data['video_source'].split(' ')
+    resolution_x, resolution_y = resolution.split('x')
+    resolution_x = int(resolution_x)
+    resolution_y = int(resolution_y)
+
+    connection_data = copy.deepcopy(connection_defaults)
+    for k, v in connection['overrides'].items():
+      connection_data[k] = copy.deepcopy(v)
+    protocol = connection_data['protocol']
+    session_id = connection['shared_session_id']
+    player_active_connection = self.__player_active_connections[session_id]
+
+    if protocol in ('srt-proxy', 'srt-direct'):
+      network_src = self.__player.get_child_by_name(f'srtsrc_{session_id}')
+    if protocol in ('udp-proxy', 'udp-direct'):
+      network_src = self.__player.get_child_by_name(f'udpsrc_{session_id}')
+    network_src.set_state(Gst.State.NULL)
+    self.__player.remove(network_src)
+    tsparse_queue = self.__player.get_child_by_name(f'tsparse_queue_{session_id}')
+    tsparse_queue.set_state(Gst.State.NULL)
+    self.__player.remove(tsparse_queue)
+    tsparse = self.__player.get_child_by_name(f'tsparse_{session_id}')
+    tsparse.set_state(Gst.State.NULL)
+    self.__player.remove(tsparse)
+    tsdemux = self.__player.get_child_by_name(f'tsdemux_{session_id}')
+    tsdemux.set_state(Gst.State.NULL)
+    self.__player.remove(tsdemux)
+    if mode in ('video', 'audio_and_video'):
+      h264parse = self.__player.get_child_by_name(f'h264parse_{session_id}')
+      h264parse.set_state(Gst.State.NULL)
+      self.__player.remove(h264parse)
+      decoder_queue = self.__player.get_child_by_name(f'decoder_queue_{session_id}')
+      decoder_queue.set_state(Gst.State.NULL)
+      self.__player.remove(decoder_queue)
+      if RASPBERRY_PI:
+        decodebin = self.__player.get_child_by_name(f'decodebin_{session_id}')
+        decodebin.set_state(Gst.State.NULL)
+        self.__player.remove(decodebin)
+      else:
+        avdec_h264 = self.__player.get_child_by_name(f'avdec_h264_{session_id}')
+        avdec_h264.set_state(Gst.State.NULL)
+        self.__player.remove(avdec_h264)
+      glvideomixer_queue = self.__player.get_child_by_name(f'glvideomixer_queue_{session_id}')
+      glvideomixer_queue.set_state(Gst.State.NULL)
+      self.__player.remove(glvideomixer_queue)
+      glvideomixer = self.__player.get_child_by_name(f'glvideomixer')
+      glvideomixer_pad = glvideomixer.get_child_by_name(f'''sink_{player_active_connection['mixer_idx']}''')
+      glvideomixer.release_request_pad(glvideomixer_pad)
+    if mode in ('audio', 'audio_and_video'):
+      opusdec_queue = self.__player.get_child_by_name(f'opusdec_queue_{session_id}')
+      opusdec_queue.set_state(Gst.State.NULL)
+      self.__player.remove(opusdec_queue)
+      opusdec = self.__player.get_child_by_name(f'opusdec_{session_id}')
+      opusdec.set_state(Gst.State.NULL)
+      self.__player.remove(opusdec)
+      audiomixer_queue = self.__player.get_child_by_name(f'audiomixer_queue_{session_id}')
+      audiomixer_queue.set_state(Gst.State.NULL)
+      self.__player.remove(audiomixer_queue)
+      audiomixer = self.__player.get_child_by_name(f'audiomixer')
+      audiomixer_pad = audiomixer.get_child_by_name(f'''sink_{player_active_connection['mixer_idx']}''')
+      audiomixer.release_request_pad(audiomixer_pad)
+
+    if protocol in ('srt-proxy', 'srt-direct'):
+      network_sink = self.__player.get_child_by_name(f'srtsink_{session_id}')
+    if protocol in ('udp-proxy', 'udp-direct'):
+      network_sink = self.__player.get_child_by_name(f'udpsink_{session_id}')
+    network_sink.set_state(Gst.State.NULL)
+    self.__player.remove(network_sink)
+    network_sink_queue = self.__player.get_child_by_name(f'network_sink_queue_{session_id}')
+    network_sink_queue_sink_pad = network_sink_queue.get_static_pad('sink')
+    mpegtsmux_tee_pad = network_sink_queue_sink_pad.get_peer()
+    network_sink_queue.set_state(Gst.State.NULL)
+    self.__player.remove(network_sink_queue)
+    mpegtsmux_tee = self.__player.get_child_by_name(f'mpegtsmux_tee')
+    mpegtsmux_tee.release_request_pad(mpegtsmux_tee_pad)
+
   def build_complete_gstreamer_launch_command(self, connections, av_setting):
     active_connections = self.store.state['active_connections']
     connection_defaults = self.store.state['settings']['connection_defaults']
@@ -439,6 +731,8 @@ class Player(object):
     resolution_x, resolution_y = resolution.split('x')
     resolution_x = int(resolution_x)
     resolution_y = int(resolution_y)
+    display_resolution_x = resolution_x
+    display_resolution_y = resolution_y
     framerate = '%d/1' % int(float(fps))
     video_bitrate = av_setting_data['video_bitrate']
     video_encoder = av_setting_data['video_encoder']
@@ -450,7 +744,7 @@ class Player(object):
     embedded = av_setting_data['embedded']
 
     launch_command_parts = []
-    for idx, connection in enumerate(connections):
+    for connection in connections:
       connection_data = copy.deepcopy(connection_defaults)
       for k, v in connection['overrides'].items():
         connection_data[k] = copy.deepcopy(v)
@@ -463,6 +757,7 @@ class Player(object):
       active_connection = active_connections[session_id]
       local_relay_address = active_connection['local_relay_address']
       local_listen_address = active_connection['local_listen_address']
+      player_active_connection = self.__player_active_connections[session_id]
       if protocol == 'srt-proxy':
         launch_command_parts.append(
           #f'srtsrc uri=srt://127.0.0.1:{local_listen_address[1]}/ localaddress=127.0.0.1 localport={local_relay_address[1]} mode=listener name=srtsrc_{session_id} '
@@ -489,32 +784,37 @@ class Player(object):
           launch_command_parts.append(
             f'udpsrc port={direct_local_port} name=udpsrc_{session_id} '
           )
-      launch_command_parts.append(f'! queue ! tsparse ')
+      launch_command_parts.append(f'! queue name=tsparse_queue_{session_id} ! tsparse name=tsparse_{session_id} ')
       if RASPBERRY_PI:
-        launch_command_parts.append(f'! tsdemux name=in_{session_id} ') # on raspberry pi the default latency is overriden in the code
+        launch_command_parts.append(f'! tsdemux name=tsdemux_{session_id} ') # on raspberry pi the default latency is overriden in the code
       else:
-        launch_command_parts.append(f'! tsdemux latency=50 name=in_{session_id} ')
+        launch_command_parts.append(f'! tsdemux latency=50 name=tsdemux_{session_id} ')
       if mode in ('video', 'audio_and_video'):
-        launch_command_parts.append(f'in_{session_id}. ! h264parse ! queue ')
+        launch_command_parts.append(f'tsdemux_{session_id}. ! h264parse name=h264parse_{session_id} ! queue name=decoder_queue_{session_id} ')
         if RASPBERRY_PI:
           #launch_command_parts.append(f'! v4l2h264dec capture-io-mode=4 ') # can't seem to decode pc video maybe if we put a video convert before it it could handle the stream
-          launch_command_parts.append(f'! decodebin capture-io-mode=4 ')
+          launch_command_parts.append(f'! decodebin capture-io-mode=4 name=decodebin_{session_id} ')
           #launch_command_parts.append(f'! avdec_h264 ')
         else:
-          launch_command_parts.append(f'! avdec_h264 ')
-        launch_command_parts.append(f'! queue ')
-        launch_command_parts.append(f'! video_mix.sink_{idx} ')
+          launch_command_parts.append(f'! avdec_h264 name=avdec_h264_{session_id} ')
+        launch_command_parts.append(f'! queue name=glvideomixer_queue_{session_id} ')
+        launch_command_parts.append(f'''! glvideomixer.sink_{player_active_connection['mixer_idx']} ''')
       if mode in ('audio', 'audio_and_video'):
-        launch_command_parts.append(f'in_{session_id}. ! queue ! opusdec ')
-        launch_command_parts.append(f'! queue ')
-        launch_command_parts.append(f'! audio_mix. ')
+        launch_command_parts.append(f'tsdemux_{session_id}. ! queue name=opusdec_queue_{session_id} ! opusdec name=opusdec_{session_id} ')
+        launch_command_parts.append(f'! queue name=audiomixer_queue_{session_id} ')
+        launch_command_parts.append(f'''! audiomixer.sink_{player_active_connection['mixer_idx']} ''')
 
     if mode in ('video', 'audio_and_video'):
-      launch_command_parts.append(f'glvideomixer name=video_mix background=1 ')
-      screen_resolution_x, _ = app.resolution()
-      x_tile_count = int(int(screen_resolution_x) / resolution_x)
-      for idx in range(len(connections)):
-        launch_command_parts.append(f'sink_{idx}::xpos={(idx%x_tile_count)*resolution_x} sink_{idx}::ypos={int(idx/x_tile_count)*resolution_y} ')
+      launch_command_parts.append(f'glvideomixer name=glvideomixer background=1 ')
+      #screen_resolution_x, _ = app.resolution()
+      #x_tile_count = int(int(screen_resolution_x) / display_resolution_x)
+      x_tile_count = math.ceil(math.sqrt(len(self.__player_active_connections)))
+      for idx, player_active_connection in enumerate(self.__player_active_connections.values()):
+        launch_command_parts.append(f'''sink_{player_active_connection['mixer_idx']}::xpos={(idx%x_tile_count)*display_resolution_x} ''')
+        launch_command_parts.append(f'''sink_{player_active_connection['mixer_idx']}::ypos={int(idx/x_tile_count)*display_resolution_y} ''')
+        launch_command_parts.append(f'''sink_{player_active_connection['mixer_idx']}::width={display_resolution_x} ''')
+        launch_command_parts.append(f'''sink_{player_active_connection['mixer_idx']}::height={display_resolution_y} ''')
+      #launch_command_parts.append(f'! capsfilter caps=video/x-raw,width=1920,height=1080 name=glvideomixer_cap ')
       if embedded == 'yes':
         if RASPBERRY_PI:
           launch_command_parts.append(f'! xvimagesink async=false name=xvimagesink ')
@@ -527,44 +827,45 @@ class Player(object):
         else:
           launch_command_parts.append(f'! glimagesink async=false name=glimagesink ')
     if mode in ('audio', 'audio_and_video'):
-      launch_command_parts.append(f'audiomixer name=audio_mix ')
+      launch_command_parts.append(f'audiomixer name=audiomixer ')
       if echo_cancellation == 'yes':
         launch_command_parts.append(f'! webrtcechoprobe name=webrtcechoprobe0 ') # not sure if this will work well after the adder as each connection may have different latency we may need one for each stream...
-      launch_command_parts.append(f'! pulsesink device={audio_out} async=false ')
+      launch_command_parts.append(f'! pulsesink device={audio_out} async=false name=pulsesink ')
 
     if mode in ('video', 'audio_and_video'):
       if RASPBERRY_PI:
         if video_source == 'webcam':
           if video_encoder == 'v4l2h264enc':
-            launch_command_parts.append(f'v4l2src device={video_in} do-timestamp=1 io-mode=5 ! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! v4l2h264enc output-io-mode=4 extra-controls="controls,video_bitrate={video_bitrate};" ')
+            launch_command_parts.append(f''''4l2src device={video_in} do-timestamp=1 io-mode=5 name=v4l2src ! capsfilter caps=video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} name=v4l2src_cap ! v4l2h264enc output-io-mode=4 extra-controls='controls,video_bitrate={video_bitrate};' name=v4l2h264enc ''')
           else:
             assert video_encoder == 'x264'
-            launch_command_parts.append(f'v4l2src device={video_in} do-timestamp=1 ! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate/1000)} speed-preset=superfast ')
+            launch_command_parts.append(f'''v4l2src device={video_in} do-timestamp=1 name=v4l2src ! capsfilter caps=video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} name=v4l2src_cap ! queue name=x264enc_queue ! x264enc tune=zerolatency bitrate={int(video_bitrate/1000)} speed-preset=superfast name=x264enc ''')
         else:
           assert video_source == 'rpicamsrc'
           assert video_encoder == 'rpicamsrc'
-          launch_command_parts.append(f'rpicamsrc rotation=90 bitrate={video_bitrate} awb-mode={awb_modes[auto_white_balance]} preview=1 preview-encoded=1 fullscreen=0 preview-x=20 preview-y=20 preview-w=320 preview-h=190 do-timestamp=1 name=rpicamsrc0 ! video/x-h264,width={resolution_x},height={resolution_y},framerate={framerate} ')
+          launch_command_parts.append(f'rpicamsrc rotation=90 bitrate={video_bitrate} awb-mode={awb_modes[auto_white_balance]} preview=1 preview-encoded=1 fullscreen=0 preview-x=20 preview-y=20 preview-w=320 preview-h=190 do-timestamp=1 name=rpicamsrc ! capsfilter caps=video/x-h264,width={resolution_x},height={resolution_y},framerate={framerate} name=rpicamsrc_cap ')
       else:
-        launch_command_parts.append(f'v4l2src device={video_in} do-timestamp=1 ')
+        launch_command_parts.append(f'v4l2src device={video_in} do-timestamp=1 name=v4l2src ')
         if video_source == 'webcam':
           #launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! videoconvert ')
-          launch_command_parts.append(f'! video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} ! videoconvert ! video/x-raw,format=I420 ')
+          launch_command_parts.append(f'! capsfilter caps=video/x-raw,width={resolution_x},height={resolution_y},framerate={framerate} name=v4l2src_cap ! videoconvert name=v4l2src_videoconvert ! capsfilter caps=video/x-raw,format=I420 name=videoconvert_cap ')
         else:
           assert video_source == 'webcam-jpeg'
           #launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} ! jpegdec ')
-          launch_command_parts.append(f'! image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} ! jpegdec ! videoconvert ! video/x-raw,format=I420 ')
+          launch_command_parts.append(f'! capsfilter caps=image/jpeg,width={resolution_x},height={resolution_y},framerate={framerate} name=v4l2src_cap ! jpegdec name=v4l2src_jpegdec ! videoconvert name=v4l2src_videoconvert ! capsfilter caps=video/x-raw,format=I420 name=videoconert_cap ')
         assert video_encoder == 'x264'
-        launch_command_parts.append(f'! queue ! x264enc tune="zerolatency" bitrate={int(video_bitrate/1000)} speed-preset=superfast ')
-      launch_command_parts.append(f'! queue ! h264parse config-interval=1 ! out. ')
+        launch_command_parts.append(f'''! queue name=x264enc_queue ! x264enc tune=zerolatency bitrate={int(video_bitrate/1000)} speed-preset=superfast name=x264enc ''')
+      launch_command_parts.append(f'! queue name=h264parse_queue ! h264parse config-interval=1 name=h264parse ! mpegtsmux. ')
 
     if mode in ('audio', 'audio_and_video'):
-      launch_command_parts.append(f'pulsesrc device={audio_in} do-timestamp=1 ')
-      launch_command_parts.append(f'! queue ! audioconvert ! audio/x-raw,format=S16LE,rate=48000,channels=2 ')
+      launch_command_parts.append(f'pulsesrc device={audio_in} do-timestamp=1 name=pulsesrc ')
+      launch_command_parts.append(f'! queue name=audioconvert_queue ! audioconvert name=audioconvert ! capsfilter caps=audio/x-raw,format=S16LE,rate=48000,channels=2 name=audioconvert_cap ')
       if echo_cancellation == 'yes':
-        launch_command_parts.append(f'! webrtcdsp ')
-      launch_command_parts.append(f'! opusenc bitrate={audio_bitrate} name=opusenc0 ! queue ! out. ')
-    launch_command_parts.append(f'mpegtsmux alignment=7 name=out ')
-    launch_command_parts.append(f'! tee name=mpegtsmux_tee ')
+        launch_command_parts.append(f'! webrtcdsp name=webrtcdsp ')
+      launch_command_parts.append(f'! opusenc bitrate={audio_bitrate} name=opusenc ! queue name=opusenc_queue ! mpegtsmux. ')
+    launch_command_parts.append(f'mpegtsmux alignment=7 name=mpegtsmux ')
+    #launch_command_parts.append(f'! tee name=mpegtsmux_tee ')
+    launch_command_parts.append(f'! tee allow-not-linked=true name=mpegtsmux_tee ')
 
     for connection in connections:
       connection_data = copy.deepcopy(connection_defaults)
@@ -579,7 +880,9 @@ class Player(object):
       active_connection = active_connections[session_id]
       local_relay_address = active_connection['local_relay_address']
       local_listen_address = active_connection['local_listen_address']
-      launch_command_parts.append(f'mpegtsmux_tee. ! queue ')
+      player_active_connection = self.__player_active_connections[session_id]
+      #launch_command_parts.append(f'''mpegtsmux_tee.sink_{player_active_connection['mixer_idx']} ! queue name=network_sink_queue_{session_id} ''')
+      launch_command_parts.append(f'''mpegtsmux_tee. ! queue name=network_sink_queue_{session_id} ''')
       if protocol == 'srt-proxy':
         launch_command_parts.append(
           #f'! srtsink uri=srt://127.0.0.1:{local_listen_address[1]}/ localaddress=127.0.0.1 localport={local_relay_address[1]} mode=caller name=srtsink_{session_id} '
@@ -610,7 +913,6 @@ class Player(object):
     launch_command = ''.join(launch_command_parts)
     return launch_command
 
-# TODO: flush out this logic
 
 # from layoutx/app.py
 
@@ -627,7 +929,7 @@ import asyncio  # @NoMove @Reimport
 @Singleton
 class Application(RegistryNode):
   def __init__(self):
-    super().__init__(widget = self, name = "app")
+    super().__init__(widget = self, name = 'app')
 
     #Import Widgets
     import layoutx.widgets
@@ -658,19 +960,19 @@ class Application(RegistryNode):
       else:
         self._use_local_loop = True
         self._loop = asyncio.get_event_loop()
-      self._tk.protocol("WM_DELETE_WINDOW", self.close)
+      self._tk.protocol('WM_DELETE_WINDOW', self.close)
       self._ui_task = self._loop.create_task(self._updater(interval))
     self._player_task = player_task
     self._proxy_task = proxy_task
 
     # Pick first system font as default if none given
     if font:
-      self._config["font"] = font
+      self._config['font'] = font
     else:
       if is_windows():
-        self._config["font"] = {"family": "Courier New", "size": 12} if "Courier New" in tkFont.families() else {"family":tkFont.families()[1], "size": 12}
+        self._config['font'] = {'family': 'Courier New', 'size': 12} if 'Courier New' in tkFont.families() else {'family':tkFont.families()[1], 'size': 12}
       else:
-        self._config["font"] = {"family": "DejaVu Sans Mono", "size": 12} if "DejaVu Sans Mono" in tkFont.families() else {"family":tkFont.families()[1], "size": 12}
+        self._config['font'] = {'family': 'DejaVu Sans Mono', 'size': 12} if 'DejaVu Sans Mono' in tkFont.families() else {'family':tkFont.families()[1], 'size': 12}
 
     if style and not self._style:
       try:
@@ -726,7 +1028,7 @@ class Application(RegistryNode):
     if len(filter_view) == 1:
       return filter_view[0]
     else:
-      raise ValueError(f"View {name} not registed")
+      raise ValueError(f'View {name} not registed')
 
   def add_view(self, view: View) -> RegistryNode:
     name = view.__class__.__name__
@@ -739,7 +1041,7 @@ class Application(RegistryNode):
 
   def add_custom_widget(self, name, cls):
     if name in self._widgets:
-      raise ValueError(f"Widget name: {name} already exists")
+      raise ValueError(f'Widget name: {name} already exists')
 
     self._widgets[name] = cls
 
@@ -748,7 +1050,7 @@ class Application(RegistryNode):
 
   def get_widget_cls(self, name):
     if name not in self._widgets:
-      raise KeyError(f"Widget: {name}, does not exist or was never added to the registry")
+      raise KeyError(f'Widget: {name}, does not exist or was never added to the registry')
     return self._widgets[name]
 
   async def _updater(self, interval):
@@ -783,11 +1085,11 @@ class MyComboBox(Widget):
         textvariable=self._textv
       ),**kwargs
     )
-    self._setter = self.connect_to_prop("value", self.on_changed_value)
-    self._trace = self._textv.trace_add("write",
+    self._setter = self.connect_to_prop('value', self.on_changed_value)
+    self._trace = self._textv.trace_add('write',
       lambda *_: self._setter(self._textv.get())
     )
-    self.connect_to_prop("suggestion", self.on_changed_suggestion)
+    self.connect_to_prop('suggestion', self.on_changed_suggestion)
 
   def on_changed_suggestion(self, value):
     self._tk.configure(values=value if value else [])
@@ -796,7 +1098,7 @@ class MyComboBox(Widget):
     self._textv.set(value)
 
   def on_disposed(self):
-    self._textv.trace_remove("write", self._trace)
+    self._textv.trace_remove('write', self._trace)
     self._setter = None
 
 def build_editor_data(defaults, overrides):
@@ -1294,7 +1596,6 @@ Box
       else:
         local_relay_address_port = 19000
       local_listen_address_port = local_relay_address_port + 1
-      # TODO: these local addresses need to be dynamic for multi-connection support
       local_relay_address = ('127.0.0.1', local_relay_address_port)
       local_listen_address = ('0.0.0.0', local_listen_address_port)
       active_connections[session_id] = {
@@ -1380,7 +1681,8 @@ Box
     active_player_selected_connections = list(x for x in selected_connections if player.has_active_connection(x))
     if active_player_selected_connections:
       player.stop_connections(active_player_selected_connections)
-    await asyncio.gather(*[self.__stop_proxy(connection) for connection in selected_connections])
+    active_proxy_selected_connections = list(x for x in selected_connections if x['shared_session_id'] in self.store.state['active_connections'])
+    await asyncio.gather(*[self.__stop_proxy(connection) for connection in active_proxy_selected_connections])
 
   def save_settings(self):
     with open(SETTINGS_FILE_PATH, 'w') as config_file:

@@ -11,7 +11,9 @@ ubuntu_*/otp-voip_*.dsc
 ubuntu_*/otp-voip_*.build
 ubuntu_*/otp-voip_*.buildinfo
 ubuntu_*/otp-voip_*.changes
+ubuntu_*/prepare_sd.sh
 shares/logs
+shares/tmp
 shares/*.pydevproject
 shares/*.project
 shares/*.bak_*
