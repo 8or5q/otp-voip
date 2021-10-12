@@ -1,0 +1,49 @@
+FROM debian:bullseye as base_dependencies
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/
+
+RUN DEBIAN_FRONTEND=noninteractive apt update -y \
+ && DEBIAN_FRONTEND=noninteractive apt --no-install-recommends -y full-upgrade \
+ && DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y \
+      software-properties-common \
+      wget \
+      gnupg2 \
+      ca-certificates
+COPY ./pi_11/build/etc_apt_sources.list /etc/apt/sources.list
+COPY ./pi_11/build/etc_apt_sources.list.d_raspi.list /etc/apt/sources.list.d/raspi.list
+RUN wget -qO - http://archive.raspberrypi.org/debian/raspberrypi.gpg.key | apt-key add - \
+ && DEBIAN_FRONTEND=noninteractive apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 9165938D90FDDD2E \
+ && DEBIAN_FRONTEND=noninteractive apt update --no-install-recommends -y --force-yes \
+ && DEBIAN_FRONTEND=noninteractive apt dist-upgrade --no-install-recommends -y --force-yes \
+ && DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y --force-yes \
+      libraspberrypi0 \
+      libraspberrypi-bin \
+      libraspberrypi-dev \      
+      raspberrypi-bootloader \
+      raspberrypi-kernel \
+ && DEBIAN_FRONTEND=noninteractive apt autoremove --no-install-recommends -y --force-yes
+
+RUN DEBIAN_FRONTEND=noninteractive apt update -y \
+ && DEBIAN_FRONTEND=noninteractive apt --no-install-recommends -y full-upgrade \
+ && DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y \
+      software-properties-common \
+      gpg-agent \
+      sudo \
+      gdebi-core \
+      xz-utils
+
+FROM base_dependencies as chat_client
+
+# required to avoid docker only install error "_tkinter.TclError: no display name and no $DISPLAY environment variable"
+RUN DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y \
+      tk8.6
+COPY pi_11/tkdnd-2.9.2-linux-armhf.tgz /
+RUN tar -zxf tkdnd-2.9.2-linux-armhf.tgz --directory /usr/share/tcltk/tcl8.6
+
+COPY pi_11/otp-voip_0.0.4_all.deb /
+RUN DEBIAN_FRONTEND=noninteractive gdebi --non-interactive otp-voip_0.0.4_all.deb
+# ignore error "_tkinter.TclError: no display name and no $DISPLAY environment variable" we installed the tkdnd dependency before
+
+COPY pi_11/libgstrpicamsrc.so /usr/lib/arm-linux-gnueabihf/gstreamer-1.0/
+
+# sudo docker build -t otp-voip/otp-voip:armhf-pi-11 -f Dockerfile_pi_11 .

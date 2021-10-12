@@ -1,0 +1,57 @@
+FROM debian:bullseye as base_dependencies
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/
+
+RUN DEBIAN_FRONTEND=noninteractive apt update -y \
+ && DEBIAN_FRONTEND=noninteractive apt --no-install-recommends -y full-upgrade \
+ && DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y \
+      software-properties-common \
+      wget \
+      gnupg2 \
+      ca-certificates
+COPY ./pi_11/build/etc_apt_sources.list /etc/apt/sources.list
+COPY ./pi_11/build/etc_apt_sources.list.d_raspi.list /etc/apt/sources.list.d/raspi.list
+RUN wget -qO - http://archive.raspberrypi.org/debian/raspberrypi.gpg.key | apt-key add - \
+ && DEBIAN_FRONTEND=noninteractive apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 9165938D90FDDD2E \
+ && DEBIAN_FRONTEND=noninteractive apt update --no-install-recommends -y --force-yes \
+ && DEBIAN_FRONTEND=noninteractive apt dist-upgrade --no-install-recommends -y --force-yes \
+ && DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y --force-yes \
+      libraspberrypi0 \
+      libraspberrypi-bin \
+      libraspberrypi-dev \      
+      raspberrypi-bootloader \
+      raspberrypi-kernel \
+ && DEBIAN_FRONTEND=noninteractive apt autoremove --no-install-recommends -y --force-yes
+
+RUN DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y --force-yes \
+      devscripts \
+      build-essential \
+      lintian \
+      dpkg-dev
+
+RUN DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y --force-yes \
+      debhelper \
+      python3 \
+      dh-python \
+      git \
+      unzip
+      
+RUN mkdir /build \
+ && cd /build \
+ && wget https://github.com/raspberrypi/firmware/archive/refs/heads/master.zip \
+ && unzip master \
+ && cp -r firmware-master/hardfp/opt/vc /opt/ \
+ && echo "/opt/vc/lib" > opt-vc.conf \
+ && chown root.root opt-vc.conf \
+ && mv opt-vc.conf /etc/ld.so.conf.d/ \
+ && ldconfig
+      
+RUN cd /build \
+ && DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y --force-yes libbrotli1=1.0.9-2+b1 \
+ && DEBIAN_FRONTEND=noninteractive apt build-dep --no-install-recommends -y --force-yes gst-plugins-good1.0=1.18.4-2 \
+ && DEBIAN_FRONTEND=noninteractive apt source --no-install-recommends -y --force-yes gst-plugins-good1.0=1.18.4-2
+
+RUN cd /build/gst-plugins-good1.0-1.18.4/ \
+ && echo 'debian/tmp/usr/lib/*/gstreamer-1.0/libgstrpicamsrc.so' >> ./debian/gstreamer1.0-plugins-good.install
+
+# sudo docker build -t otp-voip/otp-voip:armhf-pi-11-build-deb -f Dockerfile_pi_11_build_deb .

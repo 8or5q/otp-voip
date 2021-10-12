@@ -52,7 +52,7 @@ close_client = False
 
 integrity_lock = threading.Lock()
 shared_memory_lock = multiprocessing.Lock()
-shared_memory = HashTable('tmp', 1000000)
+shared_memory = HashTable('tmp', 10000) # 1000000 is to large for raspberrypi cma thresholds
 
 # otp proxy
 
@@ -816,16 +816,10 @@ class Player(object):
         launch_command_parts.append(f'''sink_{player_active_connection['mixer_idx']}::height={display_resolution_y} ''')
       #launch_command_parts.append(f'! capsfilter caps=video/x-raw,width=1920,height=1080 name=glvideomixer_cap ')
       if embedded == 'yes':
-        if RASPBERRY_PI:
-          launch_command_parts.append(f'! xvimagesink async=false name=xvimagesink ')
-        else:
-          launch_command_parts.append(f'! glimagesink async=false name=glimagesink ')
+        launch_command_parts.append(f'! glimagesink async=false name=glimagesink ')
       else:
         assert embedded == 'no'
-        if RASPBERRY_PI:
-          launch_command_parts.append(f'! xvimagesink async=false name=xvimagesink ')
-        else:
-          launch_command_parts.append(f'! glimagesink async=false name=glimagesink ')
+        launch_command_parts.append(f'! glimagesink async=false name=glimagesink ')
     if mode in ('audio', 'audio_and_video'):
       launch_command_parts.append(f'audiomixer name=audiomixer ')
       if echo_cancellation == 'yes':

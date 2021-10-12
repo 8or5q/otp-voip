@@ -12,13 +12,13 @@ X-Python3-Version: >= 3.8
 Package: otp-voip
 Architecture: all
 Section: python
-Depends: ${misc:Depends},
- ${python3:Depends},
+Depends: ${misc:Depends}, 
+ ${python3:Depends}, 
  tk8.6, 
  tcl8.6, 
  python3 (>= 3.8), 
  libsrt1.4-openssl (>=1.4.0), 
- libwebrtc-audio-processing1 (>=0.3.1), 
+ libwebrtc-audio-processing1 (>=0.3), 
  gstreamer1.0-alsa, 
  gstreamer1.0-gl, 
  gstreamer1.0-libav, 

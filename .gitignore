@@ -12,6 +12,19 @@ ubuntu_*/otp-voip_*.build
 ubuntu_*/otp-voip_*.buildinfo
 ubuntu_*/otp-voip_*.changes
 ubuntu_*/prepare_sd.sh
+pi_*/otp-voip/debian/.debhelper
+pi_*/otp-voip/debian/files
+pi_*/otp-voip/debian/otp-voip
+pi_*/otp-voip/debian/otp-voip.debhelper.log
+pi_*/otp-voip/debian/otp-voip.substvars
+pi_*/otp-voip_*.dsc
+pi_*/otp-voip_*.tar.xz
+pi_*/otp-voip_*_source.*
+pi_*/otp-voip_*.dsc
+pi_*/otp-voip_*.build
+pi_*/otp-voip_*.buildinfo
+pi_*/otp-voip_*.changes
+pi_*/prepare_sd.sh
 shares/logs
 shares/tmp
 shares/*.pydevproject
@@ -21,4 +34,4 @@ shares/*.bak_*
 todo.txt
 data
 *_dev.sh
-
+LayoutX

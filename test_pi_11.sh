@@ -33,7 +33,7 @@ x11docker --no-entrypoint --sudouser \
   --privileged=true \
   --rm \
   -- \
-  otp-voip/otp-voip:pi-11 \
+  otp-voip/otp-voip:armhf-pi-11 \
   ~/shares/otp_voip_client
 ###BLOCK-COMMENT
 
@@ -54,7 +54,7 @@ x11docker --interactive --no-entrypoint --sudouser \
   --privileged=true \
   --rm \
   -- \
-  otp-voip/otp-voip:pi-11 \
+  otp-voip/otp-voip:armhf-pi-11 \
   /bin/bash
 ###BLOCK-COMMENT
   

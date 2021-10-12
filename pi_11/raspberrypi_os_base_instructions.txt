@@ -1,0 +1,102 @@
+1. new sd card with raspbian
+
+2. set language locale etc
+
+3. under preferences enable pi cam, ssh, vnc then reboot
+
+4. install ssh keys
+cat ~/.ssh/id_rsa_home.pub | ssh pi@192.168.1.248 'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys'
+
+5. install virtual keyboard
+sudo apt install matchbox-keyboard
+
+6. change hostname
+sudo raspi-config
+under System -> Hostname change host name to raspberrypi-otp-voip
+optional increase video memory to 256 MB
+
+7. follow instructions on https://docs.linuxconsulting.mn.it/notes/remmina-vnc-raspberry to change vnc password to legacy
+ssh pi@raspberrypi-otp-voip
+sudo vncpasswd -service
+<enter password>
+sudo nano /root/.vnc/config.d/vncserver-x11
+Authentication=VncAuth
+
+8. run buster2bullseye
+cd otp-voip/raspbian_11/
+scp buster2bullseye pi@raspberrypi-otp-voip:~/
+ssh pi@raspberrypi-otp-voip
+chmod 755 buster2bullseye
+sudo ./buster2bullseye
+reboot when complete
+
+9. make a backup from SD Card Copier
+
+10. install git
+sudo apt install git
+
+11. reinstall camera libraries (https://raspberrypi.stackexchange.com/questions/67156/how-can-i-install-raspistill-raspicam-on-a-distro-that-doesnt-include-them)
+git clone https://github.com/raspberrypi/firmware
+sudo cp -r firmware/hardfp/opt/vc /opt/
+echo "/opt/vc/lib" > opt-vc.conf
+sudo chown root.root opt-vc.conf
+sudo mv opt-vc.conf /etc/ld.so.conf.d/
+sudo ldconfig
+
+12. Install otp-voip
+wget https://github.com/8or5q/otp-voip/raw/master/pi_11/install_deb.sh
+chmod 755 install_deb.sh
+./install_deb.sh
+
+For Dev
+
+1. install docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+curl -fsSL https://raw.githubusercontent.com/mviereck/x11docker/master/x11docker | sudo bash -s -- --update
+sudo install nxagent
+
+2. copy over files to pi from pc and build system
+sudo rsync -avzlh ./otp-voip pi@raspberrypi-otp-voip:~/Docker/
+ssh pi@raspberrypi-otp-voip
+cd ~/Docker/otp-voip/
+sudo docker build -t otp-voip/otp-voip:armhf-pi-11-build-deb -f Dockerfile_pi_11_build_deb .
+sudo docker run --interactive --tty --rm --volume $HOME/Docker:$HOME/Docker --volume /sys/devices/platform/soc:/sys/devices/platform/soc --device=/dev/vchiq otp-voip/otp-voip:armhf-pi-11-build-deb /bin/bash -c "cd /home/pi/Docker/otp-voip/pi_11;./build_gstreamer1.0-plugins-good_1.18.4-2_deb.sh"
+sudo docker run --interactive --tty --rm --volume $HOME/Docker:$HOME/Docker otp-voip/otp-voip:armhf-pi-11-build-deb /bin/bash -c "cd /home/pi/Docker/otp-voip/pi_11;./build_deb.sh"
+sudo docker build -t otp-voip/otp-voip:armhf-pi-11 -f Dockerfile_pi_11 .
+./test_pi_11.sh
+sudo add-apt-repository -y universe multiverse
+sudo apt update -y
+sudo apt install --no-install-recommends -y gdebi-core xz-utils
+sudo gdebi --non-interactive ~/Docker/otp-voip/pi_11/otp-voip_0.0.4_all.deb <run this from console with display active or tkinterdnd won't install properly>
+sudo cp ~/Docker/otp-voip/pi_11/libgstrpicamsrc.so /usr/lib/arm-linux-gnueabihf/gstreamer-1.0/
+rm ~/.cache/gstreamer-1.0/registry.x86_64.bin
+gst-launch-1.0 -v rpicamsrc preview=true ! fakesink
+gst-launch-1.0 -e rpicamsrc rotation=90 bitrate=524288 awb-mode=1 preview=1 preview-encoded=1 fullscreen=0 preview-x=20 preview-y=20 preview-w=320 preview-h=190 do-timestamp=1 name=rpicamsrc ! capsfilter caps=video/x-h264,width=320,height=240,framerate=30/1 name=rpicamsrc_cap ! queue name=h264parse_queue ! h264parse config-interval=1 name=h264parse ! queue name=decoder_queue_loopback_test ! decodebin capture-io-mode=4 name=decodebin_loopback_test ! queue name=glvideomixer_queue_loopback_test ! glvideomixer.sink_0 glvideomixer name=glvideomixer background=1 sink_0::xpos=0 sink_0::ypos=0 sink_0::width=320 sink_0::height=240 ! glimagesink async=false name=glimagesink
+mkdir -p ~/.otp_client/home/
+cp ~/Docker/otp-voip/.otp_client/home/*_*.rnd ~/.otp_client/home/
+cp ~/Docker/otp-voip/.otp_client/config.json ~/.otp_client/
+otp_voip_client
+exit
+scp pi@raspberrypi-otp-voip:~/Docker/otp-voip/pi_11/*.deb ~/Docker/otp-voip/pi_11/
+scp pi@raspberrypi-otp-voip:~/Docker/otp-voip/pi_11/libgstrpicamsrc.so ~/Docker/otp-voip/pi_11/
+
+3. setup tkinterdnd if it failed during deb install earlier due to missing xdisplay env variable
+python3 install_tkdnd.py
+git clone https://github.com/8or5q/LayoutX.git
+cd Layoutx/layoutx
+python3 install_tkdnd.py
+ls -Al /usr/share/tcltk/tcl8.6/tkdnd2.9.2/
+
+if we need to build our own custom tkinterdnd from https://github.com/petasis/tkdnd
+sudo apt install cmake tk8.6 tk8.6-dev tcl8.6 tcl8.6-dev
+git clone https://github.com/petasis/tkdnd
+cd tkdnd/cmake/
+git checkout tkdnd-release-test-v2.9.2
+bash build.sh
+cd release-nmake-x86_32/
+make
+sudo cp libtkdnd2.9.3.so /usr/share/tcltk/tcl8.6/tkdnd2.9.2/
+<then package this into pi_11/tkdnd-2.9.2-linux-armhf.tgz (which is a modified copy of https://github.com/petasis/tkdnd/releases/download/tkdnd-release-test-v2.9.2/tkdnd-2.9.2-linux-x64.tgz) and upload to git, this is used by the otp_voip debian installer when installing LayoutX>
+
+
