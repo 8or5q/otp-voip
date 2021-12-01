@@ -2,7 +2,6 @@
 
 DEBIAN_FRONTEND=noninteractive
 
-sudo add-apt-repository -y universe multiverse
 sudo apt update -y
 sudo apt install --no-install-recommends -y gdebi-core xz-utils
 wget https://github.com/8or5q/otp-voip/raw/master/pi_11/otp-voip_0.0.4_all.deb

@@ -6,6 +6,7 @@
 
 4. install ssh keys
 cat ~/.ssh/id_rsa_home.pub | ssh pi@192.168.1.248 'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys'
+ssh pi@192.168.1.248
 
 5. install virtual keyboard
 sudo apt install matchbox-keyboard
@@ -13,7 +14,8 @@ sudo apt install matchbox-keyboard
 6. change hostname
 sudo raspi-config
 under System -> Hostname change host name to raspberrypi-otp-voip
-optional increase video memory to 256 MB
+under System -> Password change pi password
+under Performance Options -> GPU Memory optionally increase video memory to 256 MB
 
 7. follow instructions on https://docs.linuxconsulting.mn.it/notes/remmina-vnc-raspberry to change vnc password to legacy
 ssh pi@raspberrypi-otp-voip
@@ -22,6 +24,7 @@ sudo vncpasswd -service
 sudo nano /root/.vnc/config.d/vncserver-x11
 Authentication=VncAuth
 
+(for deb 10 buster)
 8. run buster2bullseye
 cd otp-voip/raspbian_11/
 scp buster2bullseye pi@raspberrypi-otp-voip:~/
@@ -29,6 +32,8 @@ ssh pi@raspberrypi-otp-voip
 chmod 755 buster2bullseye
 sudo ./buster2bullseye
 reboot when complete
+sudo apt install software-properties-common
+sudo add-apt-repository -y universe multiverse
 
 9. make a backup from SD Card Copier
 
@@ -36,14 +41,37 @@ reboot when complete
 sudo apt install git
 
 11. reinstall camera libraries (https://raspberrypi.stackexchange.com/questions/67156/how-can-i-install-raspistill-raspicam-on-a-distro-that-doesnt-include-them)
-git clone https://github.com/raspberrypi/firmware
+git clone --depth 1 https://github.com/raspberrypi/firmware
 sudo cp -r firmware/hardfp/opt/vc /opt/
 echo "/opt/vc/lib" > opt-vc.conf
 sudo chown root.root opt-vc.conf
 sudo mv opt-vc.conf /etc/ld.so.conf.d/
 sudo ldconfig
 
-12. Install otp-voip
+(for deb 11 bullseye)
+8. update system and reboot
+sudo apt update
+sudo apt upgrade
+sudo apt install software-properties-common
+
+10. install git
+sudo apt install git
+
+11a. re-install camera libraries (https://raspberrypi.stackexchange.com/questions/67156/how-can-i-install-raspistill-raspicam-on-a-distro-that-doesnt-include-them) 
+git clone --depth 1 https://github.com/raspberrypi/firmware firmware
+sudo cp -r firmware/hardfp/opt/vc /opt/
+echo "/opt/vc/lib" > opt-vc.conf
+sudo chown root.root opt-vc.conf
+sudo mv opt-vc.conf /etc/ld.so.conf.d/
+sudo ldconfig
+
+11b. re-install camera test software (https://forums.raspberrypi.com/viewtopic.php?p=1935810)
+sudo nano /boot/config.txt
+remove the line "camera_auto_detect=1", and add "start_x=1"
+
+(for deb 10 buster and deb 11 bullseye)
+
+12. Install otp-voip (be sure to run from desktop terminl or tkDND will fail to install as it can't determine tcl/tk installation status)
 wget https://github.com/8or5q/otp-voip/raw/master/pi_11/install_deb.sh
 chmod 755 install_deb.sh
 ./install_deb.sh

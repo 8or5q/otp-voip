@@ -785,10 +785,7 @@ class Player(object):
             f'udpsrc port={direct_local_port} name=udpsrc_{session_id} '
           )
       launch_command_parts.append(f'! queue name=tsparse_queue_{session_id} ! tsparse name=tsparse_{session_id} ')
-      if RASPBERRY_PI:
-        launch_command_parts.append(f'! tsdemux name=tsdemux_{session_id} ') # on raspberry pi the default latency is overriden in the code
-      else:
-        launch_command_parts.append(f'! tsdemux latency=50 name=tsdemux_{session_id} ')
+      launch_command_parts.append(f'! tsdemux latency=50 name=tsdemux_{session_id} ')
       if mode in ('video', 'audio_and_video'):
         launch_command_parts.append(f'tsdemux_{session_id}. ! h264parse name=h264parse_{session_id} ! queue name=decoder_queue_{session_id} ')
         if RASPBERRY_PI:
