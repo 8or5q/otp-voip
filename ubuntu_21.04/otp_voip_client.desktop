@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Exec=otp_voip_client
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Name[en_US]=OTP VOIP Client
+Name=OTP VOIP Client
+Comment[en_US]=One-Time-Pad based Voice/Video Over IP Client
+Comment=One-Time-Pad based Voice/Video Over IP Client
+
