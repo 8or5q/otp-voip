@@ -1,6 +1,7 @@
 [Desktop Entry]
 Type=Application
 Exec=otp_voip_client
+Terminal=true
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
