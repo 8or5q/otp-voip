@@ -18,7 +18,7 @@ A quick and dirty One Time Pad Video and Voice Chat tool written in Python based
 * [WebRTC AudioProcessing v0.3.1](https://www.freedesktop.org/software/pulseaudio/webrtc-audio-processing/)
 
 ## Buliding From Source
-I recommend everyone build from source as the new version based on ubuntu 21.04/21.10 doesn't require any custom built dependency packages. 
+I recommend everyone build from source as the new version based on ubuntu 21.04 doesn't require any custom built dependency packages (21.10 seems to have some kind of issue most probably due to a race condition in some gstreamer library that causes it to crash). 
 The following instruction assumes you are building the amd64 PC variant but there is also a armhf variant for the Raspberry PI but it requires a number of special steps.
 * Clone this repository to ~/Docker/otp-voip/ if you intend to use the docker test_pX.sh scripts as is.
 * Build the otp-proxy debian package
